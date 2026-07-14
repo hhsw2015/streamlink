@@ -111,43 +111,58 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
 async function tryCloudExtract(sourceUrl, quality) {
   const cloudQuality = canonCloudQuality(quality);
+  const tag = `[cloud ${cloudQuality}]`;
+  console.log(tag, "POST", `${CLOUD_BASE}/extract`, {source_url: sourceUrl, quality: cloudQuality});
   try {
     const submitRes = await fetch(`${CLOUD_BASE}/extract`, {
       method: "POST",
       headers: { "X-Auth": CLOUD_TOKEN, "Content-Type": "application/json" },
       body: JSON.stringify({ source_url: sourceUrl, quality: cloudQuality }),
     });
+    console.log(tag, "submit response status =", submitRes.status);
+    const submitText = await submitRes.text();
+    console.log(tag, "submit body =", submitText.slice(0, 500));
     if (!submitRes.ok) {
-      console.warn("[streamlink-redirect] cloud submit HTTP", submitRes.status);
+      console.warn(tag, "submit not ok");
       return null;
     }
-    const submit = await submitRes.json();
-    if (submit.status === "success" && submit.direct_url) return submit;
-    if (!submit.job_id) return null;
+    let submit;
+    try { submit = JSON.parse(submitText); }
+    catch (e) { console.warn(tag, "submit body not JSON:", e); return null; }
+    if (submit.status === "success" && submit.direct_url) {
+      console.log(tag, "cache-hit inline, direct_url =", submit.direct_url);
+      return submit;
+    }
+    if (!submit.job_id) { console.warn(tag, "no job_id"); return null; }
+    console.log(tag, "job_id =", submit.job_id, "polling every", CLOUD_POLL_INTERVAL_MS, "ms");
 
     for (let i = 0; i < CLOUD_POLL_MAX_TRIES; i++) {
       await sleep(CLOUD_POLL_INTERVAL_MS);
       const stRes = await fetch(`${CLOUD_BASE}/status/${submit.job_id}`, {
         headers: { "X-Auth": CLOUD_TOKEN },
       });
-      if (!stRes.ok) continue;
+      if (!stRes.ok) { console.warn(tag, `status HTTP ${stRes.status} @try ${i}`); continue; }
       const st = await stRes.json();
+      console.log(tag, `try ${i} status=${st.status} progress=${st.progress || 0}`);
       if (st.status === "success") {
         const rRes = await fetch(`${CLOUD_BASE}/result/${submit.job_id}`, {
           headers: { "X-Auth": CLOUD_TOKEN },
         });
+        console.log(tag, "result response =", rRes.status);
         if (!rRes.ok) return null;
-        return await rRes.json();
+        const r = await rRes.json();
+        console.log(tag, "final direct_url =", r.direct_url);
+        return r;
       }
       if (st.status === "failed") {
-        console.warn("[streamlink-redirect] cloud job failed:", st.error);
+        console.warn(tag, "job failed:", st.error);
         return null;
       }
     }
-    console.warn("[streamlink-redirect] cloud poll timed out");
+    console.warn(tag, "poll timed out after", CLOUD_POLL_MAX_TRIES, "tries");
     return null;
   } catch (err) {
-    console.warn("[streamlink-redirect] cloud fetch threw:", err);
+    console.warn(tag, "fetch threw:", err.name, err.message, err.stack);
     return null;
   }
 }
