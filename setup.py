@@ -47,7 +47,10 @@ def is_wheel_for_windows(argv):
 
 
 entry_points = {
-    "console_scripts": ["streamlink=streamlink_cli.main:main"],
+    "console_scripts": [
+        "streamlink=streamlink_cli.main:main",
+        "streamlink-redirect=streamlink_cli.redirect:main",
+    ],
 }
 
 if is_wheel_for_windows(sys.argv):

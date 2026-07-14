@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Streamlink Redirect",
+  "version": "0.1.0",
+  "description": "Right-click a video page or link to play it via streamlink-redirect.",
+  "permissions": ["contextMenus", "nativeMessaging", "notifications"],
+  "background": {
+    "service_worker": "bg.js"
+  },
+  "icons": {},
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqoyLgjs7w2FHurqeV5hYio8jEnapeGmPqD5ktIkCbVObkFsY70BG+iQGneg6wEtKUycnCbGwFKDard+F0XUMsbKcJCc60L7Me/HuWphpu4YrIu7z9K05hysYAcZ1ta7KGS8t2BgnVix5ul4XqoOQV0LIDSLM+3R81N2d1t4LpvLZNRg3hopt4SApiMl91lQ7dogyJKzIMX+zlF2xg/nUCeZ7jo4Maa/7niHjzoU7JXOCmUzdncjfyKGoruVYUMfri0NengO7OoKxYFQQ8IY3bpNuufAFlHUsPNGUOLZ9CcqdeDTP49OJJEVxBl4PxvDplaCJYARPHBOP+Tw0bwmpPQIDAQAB"
+}
