@@ -12,7 +12,7 @@ const CLOUD_POLL_MAX_TRIES = 90;
 // $edurl = percent-encoded resolved video URL. $durl = raw. See src/streamlink_cli/redirect.py.
 const PLAYERS = [
   { id: "iina",      name: "IINA",       scheme: "iina://weblink?url=$edurl" },
-  { id: "senplayer", name: "SenPlayer",  app: "SenPlayer" },
+  { id: "senplayer", name: "SenPlayer",  scheme: "senplayer://x-callback-url/play?url=$edurl" },
   { id: "vlc",       name: "VLC",        scheme: "vlc://$durl" },
   { id: "mpv",       name: "mpv",        scheme: "mpv://$edurl" },
   { id: "infuse",    name: "Infuse",     scheme: "infuse://x-callback-url/play?url=$durl" },
