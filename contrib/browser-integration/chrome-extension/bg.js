@@ -1,9 +1,15 @@
 const HOST = "com.streamlink.redirect";
 
-// URL scheme templates adapted from OpenList's player list. Only entries usable on macOS.
+// Cloudflare Worker extractor. Preferred path — direct fetch, no native host needed.
+// On failure the click falls back to the native host (which runs streamlink-redirect
+// and forces the local vthreads-direct path via VTHREADS_SKIP_CLOUD=1).
+const CLOUD_BASE = "https://extractor.bugcf.ccwu.cc";
+const CLOUD_TOKEN = "test-token-2026-extractor";
+const CLOUD_POLL_INTERVAL_MS = 2000;
+const CLOUD_POLL_MAX_TRIES = 90;
+
+// URL scheme templates adapted from OpenList's player list. macOS-friendly players only.
 // $edurl = percent-encoded resolved video URL. $durl = raw. See src/streamlink_cli/redirect.py.
-// Two entry types: `scheme` = URL-scheme handoff (preferred, works cross-browser).
-// `app` = `open -a AppName URL` (macOS only, but works for players without a documented scheme).
 const PLAYERS = [
   { id: "iina",      name: "IINA",       scheme: "iina://weblink?url=$edurl" },
   { id: "senplayer", name: "SenPlayer",  app: "SenPlayer" },
@@ -22,14 +28,11 @@ const DEFAULT_PLAYER_ID = "iina";
 const DEFAULT_QUALITY = "best";
 
 chrome.runtime.onInstalled.addListener(() => {
-  // Fast-path top-level items — default player, common qualities
   chrome.contextMenus.create({
     id: "sl-quick",
     title: "Open in Streamlink (IINA, best)",
     contexts: ["link", "page", "video", "selection"],
   });
-
-  // Nested submenu for full control
   chrome.contextMenus.create({
     id: "sl-root",
     title: "Open in Streamlink...",
@@ -53,7 +56,7 @@ chrome.runtime.onInstalled.addListener(() => {
   }
 });
 
-chrome.contextMenus.onClicked.addListener((info, tab) => {
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   const url = info.linkUrl || info.srcUrl || info.pageUrl || (tab && tab.url);
   if (!url) return notify("no URL to open");
 
@@ -66,35 +69,124 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     playerId = m[1];
     quality = m[2];
   } else {
-    return; // parent-only click, ignore
+    return;
   }
 
   const player = PLAYERS.find((p) => p.id === playerId);
   if (!player) return notify("unknown player: " + playerId);
 
-  const payload = { url, quality };
+  console.log("[streamlink-redirect] clicked", { url, quality, player: player.name });
+
+  // Path A: cloud extractor. Return early on success.
+  const cloudResult = await tryCloudExtract(url, quality);
+  if (cloudResult && cloudResult.direct_url) {
+    notify(player.name + " " + quality + " → launching (cloud)");
+    launchWithPlayer(player, cloudResult.direct_url);
+    return;
+  }
+
+  // Path B: local streamlink-redirect via native host. Extension already tried cloud
+  // and failed, so tell the plugin to skip cloud (VTHREADS_SKIP_CLOUD=1).
+  const payload = { url, quality, skip_cloud: true };
   if (player.scheme) payload.scheme = player.scheme;
   else if (player.app) payload.player = player.app;
-  console.log("[streamlink-redirect] sending", { ...payload, playerLabel: player.name });
-  chrome.runtime.sendNativeMessage(
-    HOST,
-    payload,
-    (response) => {
-      if (chrome.runtime.lastError) {
-        const err = chrome.runtime.lastError.message;
-        console.error("[streamlink-redirect] native error:", err);
-        notify("host error: " + err);
-        return;
-      }
-      console.log("[streamlink-redirect] response:", response);
-      if (!response || !response.ok) {
-        notify("failed: " + (response && response.error ? response.error : "unknown"));
-        return;
-      }
-      notify(player.name + " " + quality + " → resolving (pid " + response.pid + ")");
-    },
-  );
+
+  console.log("[streamlink-redirect] cloud failed, using native host", payload);
+  chrome.runtime.sendNativeMessage(HOST, payload, (response) => {
+    if (chrome.runtime.lastError) {
+      const err = chrome.runtime.lastError.message;
+      console.error("[streamlink-redirect] native error:", err);
+      notify("host error: " + err);
+      return;
+    }
+    if (!response || !response.ok) {
+      notify("failed: " + (response && response.error ? response.error : "unknown"));
+      return;
+    }
+    notify(player.name + " " + quality + " → launching (local, pid " + response.pid + ")");
+  });
 });
+
+async function tryCloudExtract(sourceUrl, quality) {
+  const cloudQuality = canonCloudQuality(quality);
+  try {
+    const submitRes = await fetch(`${CLOUD_BASE}/extract`, {
+      method: "POST",
+      headers: { "X-Auth": CLOUD_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ source_url: sourceUrl, quality: cloudQuality }),
+    });
+    if (!submitRes.ok) {
+      console.warn("[streamlink-redirect] cloud submit HTTP", submitRes.status);
+      return null;
+    }
+    const submit = await submitRes.json();
+    if (submit.status === "success" && submit.direct_url) return submit;
+    if (!submit.job_id) return null;
+
+    for (let i = 0; i < CLOUD_POLL_MAX_TRIES; i++) {
+      await sleep(CLOUD_POLL_INTERVAL_MS);
+      const stRes = await fetch(`${CLOUD_BASE}/status/${submit.job_id}`, {
+        headers: { "X-Auth": CLOUD_TOKEN },
+      });
+      if (!stRes.ok) continue;
+      const st = await stRes.json();
+      if (st.status === "success") {
+        const rRes = await fetch(`${CLOUD_BASE}/result/${submit.job_id}`, {
+          headers: { "X-Auth": CLOUD_TOKEN },
+        });
+        if (!rRes.ok) return null;
+        return await rRes.json();
+      }
+      if (st.status === "failed") {
+        console.warn("[streamlink-redirect] cloud job failed:", st.error);
+        return null;
+      }
+    }
+    console.warn("[streamlink-redirect] cloud poll timed out");
+    return null;
+  } catch (err) {
+    console.warn("[streamlink-redirect] cloud fetch threw:", err);
+    return null;
+  }
+}
+
+function launchWithPlayer(player, directUrl) {
+  // Both scheme-based and app-based launches go through the native host with
+  // `prefetched: true`. The host runs `open` on macOS, which correctly hands
+  // the URL to the player without navigating away from the current browser tab
+  // (chrome.tabs.update on an iina:// URL would blank the YouTube page).
+  const payload = { url: directUrl, quality: "best", skip_cloud: true, prefetched: true };
+  if (player.scheme) {
+    payload.scheme = player.scheme;
+  } else if (player.app) {
+    payload.player = player.app;
+  }
+  chrome.runtime.sendNativeMessage(HOST, payload, (response) => {
+    if (chrome.runtime.lastError) {
+      console.error("[streamlink-redirect] launch host error:", chrome.runtime.lastError.message);
+      notify("launch failed: " + chrome.runtime.lastError.message);
+      return;
+    }
+    if (!response || !response.ok) {
+      notify("launch failed: " + (response && response.error ? response.error : "unknown"));
+    }
+  });
+}
+
+function canonCloudQuality(q) {
+  const s = String(q || "best").toLowerCase().trim();
+  if (["best", "smallest", "audio_only"].includes(s)) return s;
+  if (s === "worst") return "smallest";
+  const aliases = { fhd: "1080p", qhd: "1440p", "2k": "1440p",
+                    uhd: "2160p", "4k": "2160p", hd: "720p", sd: "480p" };
+  if (aliases[s]) return aliases[s];
+  const m = s.match(/(\d{3,4})/);
+  return m ? `${m[1]}p` : "best";
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 function notify(message) {
   chrome.notifications.create({

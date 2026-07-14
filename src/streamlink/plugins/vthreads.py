@@ -44,11 +44,57 @@ from streamlink.stream.http import HTTPStream
 from streamlink.stream.stream import Stream
 
 
+def _canon_cloud_quality(q: str) -> str:
+    """Mirror worker.js:canonQuality so local cache keys match the cloud's dedup key."""
+    s = (q or "best").lower().strip()
+    if s in ("best", "smallest", "audio_only"):
+        return s
+    if s == "worst":
+        return "smallest"
+    aliases = {"fhd": "1080p", "qhd": "1440p", "2k": "1440p",
+               "uhd": "2160p", "4k": "2160p", "hd": "720p", "sd": "480p"}
+    if s in aliases:
+        return aliases[s]
+    m = re.search(r"(\d{3,4})", s)
+    return f"{m.group(1)}p" if m else "best"
+
+
+def _guess_selected_stream_hint() -> str | None:
+    """Sniff sys.argv for a stream/quality token, without knowing the streams dict yet.
+    Used before extract to pick the quality for the cloud call. Returns None if unclear."""
+    argv = sys.argv[1:]
+    known = {"best", "worst", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p",
+             "1080p60", "720p60"}
+    skip_next = False
+    for tok in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok.startswith("--"):
+            if "=" not in tok:
+                skip_next = True
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            skip_next = True
+            continue
+        if tok in known:
+            return tok
+    return None
+
+
 log = getLogger(__name__)
 
 
 VTHREADS_BASE = os.environ.get("VTHREADS_ENDPOINT", "https://vthreads.top").rstrip("/")
 VTHREADS_REFERER = f"{VTHREADS_BASE}/zh/"
+
+# Cloud extractor (Cloudflare Worker). Preferred when reachable — bypasses vthreads
+# rate limits by fronting via CF and de-duplicating with a shared cache. Falls back
+# to direct vthreads.top calls if unset, unreachable, or reports no direct_url.
+CLOUD_BASE = os.environ.get("VTHREADS_CLOUD_ENDPOINT", "https://extractor.bugcf.ccwu.cc").rstrip("/")
+CLOUD_TOKEN = os.environ.get("VTHREADS_CLOUD_TOKEN", "test-token-2026-extractor")
+CLOUD_POLL_INTERVAL = 2.0
+CLOUD_POLL_TIMEOUT = 300.0
 
 POLL_INTERVAL = 2.0
 POLL_TIMEOUT = 600.0
@@ -76,8 +122,10 @@ def _cache_save(path: str, data: dict) -> None:
     try:
         os.makedirs(_CACHE_DIR, exist_ok=True)
         import json as _json
-        with open(path, "w") as f:
+        tmp = path + "." + str(os.getpid()) + ".tmp"
+        with open(tmp, "w") as f:
             _json.dump(data, f)
+        os.replace(tmp, path)  # atomic on POSIX
     except OSError:
         pass
 
@@ -233,6 +281,115 @@ class VThreads(Plugin):
             ),
         }
 
+    def _cloud_headers(self) -> dict:
+        return {"X-Auth": CLOUD_TOKEN, "Content-Type": "application/json", "Accept": "application/json"}
+
+    def _cloud_extract(self, quality: str) -> dict | None:
+        cloud_quality = _canon_cloud_quality(quality)
+        cache_key = self.url + "|q=" + cloud_quality
+        cached = _cache_get(_URL_CACHE_FILE, "cloud:" + cache_key, _URL_CACHE_TTL)
+        if cached and cached.get("direct_url"):
+            expires = cached.get("expires_at") or 0
+            # Cloud reports expires_at in ms since epoch. Refuse entries that would
+            # expire before the player has time to start (5 min buffer, same as cloud
+            # cache logic in worker.js).
+            if expires and expires > int(time.time() * 1000) + 300_000:
+                log.info("vthreads: cloud cache hit for " + cloud_quality)
+                return cached
+        submit_url = CLOUD_BASE + "/extract"
+        log.info("vthreads: asking cloud extractor for " + cloud_quality)
+        try:
+            res = self.session.http.post(
+                submit_url,
+                headers=self._cloud_headers(),
+                json={"source_url": self.url, "quality": cloud_quality},
+                timeout=30,
+                retries=0,
+                raise_for_status=False,
+            )
+        except Exception as err:
+            log.info("vthreads: cloud submit error: " + type(err).__name__)
+            return None
+        if res.status_code == 503:
+            log.info("vthreads: cloud reports all upstreams cooling down (503)")
+            return None
+        if res.status_code >= 400:
+            log.info("vthreads: cloud submit HTTP " + str(res.status_code))
+            return None
+        try:
+            payload = res.json()
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("status") == "success" and payload.get("direct_url"):
+            _cache_put(_URL_CACHE_FILE, "cloud:" + cache_key, payload)
+            return payload
+        job_id = payload.get("job_id")
+        if not job_id:
+            return None
+        return self._cloud_poll(job_id, cache_key)
+
+    def _cloud_poll(self, job_id: str, cache_key: str) -> dict | None:
+        status_url = CLOUD_BASE + "/status/" + job_id
+        result_url = CLOUD_BASE + "/result/" + job_id
+        deadline = time.monotonic() + CLOUD_POLL_TIMEOUT
+        last_status = ""
+        last_progress = -1.0
+        while time.monotonic() < deadline:
+            try:
+                res = self.session.http.get(status_url, headers=self._cloud_headers(),
+                                            timeout=30, retries=0, raise_for_status=False)
+                if res.status_code >= 500 or res.status_code == 429:
+                    time.sleep(3)
+                    continue
+                if res.status_code >= 400:
+                    return None
+                info = res.json()
+            except Exception:
+                time.sleep(CLOUD_POLL_INTERVAL)
+                continue
+            if not isinstance(info, dict):
+                return None
+            status = str(info.get("status", ""))
+            progress = float(info.get("progress") or 0)
+            if status != last_status or progress - last_progress >= 10:
+                log.info("vthreads: cloud " + status + " " + str(int(progress)) + "%")
+                last_status = status
+                last_progress = progress
+            if status == "success":
+                try:
+                    r = self.session.http.get(result_url, headers=self._cloud_headers(),
+                                              timeout=30, retries=0, raise_for_status=False)
+                    if r.status_code >= 400:
+                        return None
+                    result = r.json()
+                except Exception:
+                    return None
+                if isinstance(result, dict) and result.get("direct_url"):
+                    _cache_put(_URL_CACHE_FILE, "cloud:" + cache_key, result)
+                    return result
+                return None
+            if status == "failed":
+                log.info("vthreads: cloud job failed: " + str(info.get("error") or ""))
+                return None
+            time.sleep(CLOUD_POLL_INTERVAL)
+        log.info("vthreads: cloud poll timed out")
+        return None
+
+    def _streams_from_cloud(self, result: dict) -> dict:
+        direct_url = result["direct_url"]
+        required = result.get("required_headers") or {}
+        headers = {"Referer": VTHREADS_REFERER}
+        headers.update(required)
+        # Cloud returns one quality per call, so map to the label the caller asked for
+        # plus a "best" alias for convenience.
+        quality_label = result.get("quality") or "best"
+        key = _normalize_quality(quality_label)
+        stream = HTTPStream(self.session, direct_url, headers=headers)
+        log.info("vthreads: cloud resolved " + key + " -> " + direct_url)
+        return {key: stream, "best": stream}
+
     def _api_json(self, url: str, params: dict | None = None):
         last_err: Exception | None = None
         for attempt in range(5):
@@ -293,7 +450,25 @@ class VThreads(Plugin):
         return data
 
     def _get_streams(self):
-        data = self._extract()
+        # Local vthreads.top first (native CLI semantics — direct, no third-party hop).
+        # On failure fall back to the Cloud Worker extractor, which fronts vthreads via
+        # Cloudflare (rotating IPs help when upstream is rate-limiting our IP).
+        # Set VTHREADS_SKIP_CLOUD=1 to also disable the cloud fallback (used by the
+        # browser extension when its own cloud attempt already failed).
+        wanted_quality = _guess_selected_stream_hint() or "best"
+        skip_cloud = os.environ.get("VTHREADS_SKIP_CLOUD") in ("1", "true", "yes")
+
+        try:
+            data = self._extract()
+        except PluginError as local_err:
+            if skip_cloud or not CLOUD_TOKEN:
+                raise
+            log.info("vthreads: local failed (" + str(local_err) + "), trying cloud")
+            cloud_result = self._cloud_extract(wanted_quality)
+            if cloud_result and cloud_result.get("direct_url"):
+                self.title = cloud_result.get("title") or self.title
+                return self._streams_from_cloud(cloud_result)
+            raise
         self.title = data.get("title")
 
         streams: dict[str, Stream] = {}
@@ -321,7 +496,17 @@ class VThreads(Plugin):
             target = _resolve_stream_key(streams, wanted)
             if target and isinstance(streams.get(target), VThreadsMergeStream):
                 log.info("vthreads: prefetching " + target)
-                streams[target]._resolve()
+                try:
+                    streams[target]._resolve()
+                except StreamError as merge_err:
+                    if skip_cloud or not CLOUD_TOKEN:
+                        raise
+                    log.info("vthreads: merge failed (" + str(merge_err) + "), trying cloud")
+                    cloud_result = self._cloud_extract(target)
+                    if cloud_result and cloud_result.get("direct_url"):
+                        streams.update(self._streams_from_cloud(cloud_result))
+                    else:
+                        raise
 
         return streams
 

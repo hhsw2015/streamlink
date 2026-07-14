@@ -58,13 +58,17 @@ def _child_env() -> dict:
     return env
 
 
-def launch(url: str, quality: str, player: str, scheme: str) -> int:
+def launch(url: str, quality: str, player: str, scheme: str, skip_cloud: bool) -> int:
     child_log = open(CHILD_LOG, "a")
     child_log.write(
         "\n===== " + _dt.datetime.now().isoformat(timespec="seconds")
-        + " url=" + url + " quality=" + quality + " scheme=" + (scheme or "") + " =====\n",
+        + " url=" + url + " quality=" + quality + " scheme=" + (scheme or "")
+        + " skip_cloud=" + str(skip_cloud) + " =====\n",
     )
     child_log.flush()
+    env = _child_env()
+    if skip_cloud:
+        env["VTHREADS_SKIP_CLOUD"] = "1"
     cmd = [
         STREAMLINK_REDIRECT,
         "--port", "8888",
@@ -84,7 +88,7 @@ def launch(url: str, quality: str, player: str, scheme: str) -> int:
         stdout=child_log,
         stderr=subprocess.STDOUT,
         start_new_session=True,  # detach so it survives after we return to Chrome
-        env=_child_env(),
+        env=env,
     )
     return proc.pid
 
@@ -98,10 +102,34 @@ def main() -> int:
         quality = str(msg.get("quality", "best")).strip() or "best"
         player = str(msg.get("player", DEFAULT_PLAYER)).strip() or DEFAULT_PLAYER
         scheme = str(msg.get("scheme", "")).strip()
+        # `skip_cloud` = extension already tried the cloud extractor itself and failed;
+        # skip cloud in the plugin so we do NOT double-hit the same failing service.
+        skip_cloud = bool(msg.get("skip_cloud", False))
+        # `prefetched` = url is already a direct playable URL from the cloud extractor;
+        # skip streamlink entirely and just hand it to the player's app via `open -a`.
+        prefetched = bool(msg.get("prefetched", False))
         if not url:
             write_message({"ok": False, "error": "empty url"})
             return 1
-        pid = launch(url, quality, player, scheme)
+        if prefetched:
+            if scheme:
+                from urllib.parse import quote as _q
+                import base64 as _b64
+                launch_url = (
+                    scheme
+                    .replace("$edurl", _q(url, safe=""))
+                    .replace("$bdurl", _b64.b64encode(url.encode()).decode())
+                    .replace("$durl", url)
+                    .replace("$name", "")
+                )
+                log(f"prefetched launch: open {launch_url}")
+                subprocess.Popen(["open", launch_url])
+            else:
+                log(f"prefetched launch: open -a {player} {url}")
+                subprocess.Popen(["open", "-a", player, url])
+            write_message({"ok": True, "pid": 0, "log": CHILD_LOG})
+            return 0
+        pid = launch(url, quality, player, scheme, skip_cloud)
         log("launched streamlink-redirect pid=" + str(pid))
         write_message({"ok": True, "pid": pid, "log": CHILD_LOG})
         return 0
