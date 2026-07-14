@@ -389,8 +389,16 @@ class VThreads(Plugin):
 
     def _streams_from_cloud(self, result: dict) -> dict:
         direct_url = result["direct_url"]
+        # Default to a real Chrome UA + Referer so vthreads (behind Cloudflare bot-fight)
+        # doesn't 1010-reject the request. Cloud-provided required_headers override these.
+        headers = {
+            "Referer": VTHREADS_REFERER,
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+            ),
+        }
         required = result.get("required_headers") or {}
-        headers = {"Referer": VTHREADS_REFERER}
         headers.update(required)
         # Cloud returns one quality per call, so map to the label the caller asked for
         # plus a "best" alias for convenience.
@@ -491,10 +499,18 @@ class VThreads(Plugin):
             if fmt == "merge" or "/api/download_merge" in path:
                 streams[key] = VThreadsMergeStream(self.session, full_url, quality=key)
             else:
+                # vthreads.top sits behind Cloudflare; direct proxy fetches need a
+                # real UA + Referer or CF returns 1010 (browser_signature_banned).
                 streams[key] = HTTPStream(
                     self.session,
                     full_url,
-                    headers={"Referer": VTHREADS_REFERER},
+                    headers={
+                        "Referer": VTHREADS_REFERER,
+                        "User-Agent": (
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+                        ),
+                    },
                 )
             log.debug("vthreads: media " + repr(media["quality"]) + " -> " + key + " (" + (fmt or "http") + ")")
 
@@ -614,7 +630,13 @@ class VThreadsMergeStream(HTTPStream):
     __shortname__ = "http"
 
     def __init__(self, session, submit_url: str, quality: str = ""):
-        super().__init__(session, submit_url, headers={"Referer": VTHREADS_REFERER})
+        super().__init__(session, submit_url, headers={
+            "Referer": VTHREADS_REFERER,
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+            ),
+        })
         self._submit_url = submit_url
         self._quality = quality
         self._resolved = False
