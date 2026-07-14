@@ -190,10 +190,13 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// 1x1 dark-gray PNG (chrome.notifications rejects SVG data-URLs — needs a real bitmap).
+const NOTIFY_ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
 function notify(message) {
   chrome.notifications.create({
     type: "basic",
-    iconUrl: "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><rect width='64' height='64' fill='%23222'/><text x='50%25' y='55%25' font-size='40' text-anchor='middle' fill='white' font-family='sans-serif'>SL</text></svg>",
+    iconUrl: NOTIFY_ICON,
     title: "Streamlink Redirect",
     message,
   });
