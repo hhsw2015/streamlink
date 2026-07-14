@@ -27,9 +27,9 @@ fi
 echo "==> using PY=$PY"
 
 echo
-echo "==> 1/4 pytest tests/plugins/test_vthreads.py"
+echo "==> 1/4 pytest tests/plugins/test_vthreads*.py"
 if [[ -n "${PYTEST:-}" ]]; then
-  (cd "$REPO" && "$PYTEST" tests/plugins/test_vthreads.py -x -q)
+  (cd "$REPO" && "$PYTEST" tests/plugins/test_vthreads.py tests/plugins/test_vthreads_paths.py -x -q)
 else
   echo "  [SKIP] pytest not installed"
 fi
