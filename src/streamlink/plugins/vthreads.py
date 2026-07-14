@@ -282,7 +282,17 @@ class VThreads(Plugin):
         }
 
     def _cloud_headers(self) -> dict:
-        return {"X-Auth": CLOUD_TOKEN, "Content-Type": "application/json", "Accept": "application/json"}
+        # Cloudflare's bot-fight rejects the default python-requests / streamlink UA
+        # with error 1010. Send a real Chrome UA — same string used for vthreads calls.
+        return {
+            "X-Auth": CLOUD_TOKEN,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+            ),
+        }
 
     def _cloud_extract(self, quality: str) -> dict | None:
         cloud_quality = _canon_cloud_quality(quality)
