@@ -93,19 +93,19 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   else if (player.app) payload.player = player.app;
 
   console.log("[streamlink-redirect] cloud failed, using native host", payload);
-  notify("cloud unavailable, falling back to local");
+  notify("cloud unavailable, falling back to local", "Local");
   chrome.runtime.sendNativeMessage(HOST, payload, (response) => {
     if (chrome.runtime.lastError) {
       const err = chrome.runtime.lastError.message;
       console.error("[streamlink-redirect] native error:", err);
-      notify("host error: " + err);
+      notify("host error: " + err, "Local");
       return;
     }
     if (!response || !response.ok) {
-      notify("failed: " + (response && response.error ? response.error : "unknown"));
+      notify("failed: " + (response && response.error ? response.error : "unknown"), "Local");
       return;
     }
-    notify(player.name + " " + quality + " → launching (local, pid " + response.pid + ")");
+    notify(player.name + " " + quality + " → launching (local, pid " + response.pid + ")", "Local");
   });
 });
 
@@ -208,11 +208,11 @@ function sleep(ms) {
 // 1x1 dark-gray PNG (chrome.notifications rejects SVG data-URLs — needs a real bitmap).
 const NOTIFY_ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
-function notify(message) {
+function notify(message, subtitle = "Cloud") {
   chrome.notifications.create({
     type: "basic",
     iconUrl: NOTIFY_ICON,
-    title: "Streamlink Redirect",
+    title: "Streamlink ☁ " + subtitle,
     message,
   });
 }

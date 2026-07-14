@@ -156,15 +156,15 @@ def main() -> int:
         basicConfig(stream=sys.stderr, level="info", format="[{name}] {message}", style="{")
 
     args.url = _clean_url(args.url)
-    _notify_mac("Streamlink Redirect", "resolving " + args.stream + " ...")
+    _notify_mac("Streamlink 💻 Local","resolving " + args.stream + " ...")
     try:
         target = _resolve_url(args.url, args.stream)
     except Exception as err:
         msg = type(err).__name__ + ": " + str(err)
         print("error: " + msg, file=sys.stderr)
-        _notify_mac("Streamlink Redirect failed", msg)
+        _notify_mac("Streamlink 💻 Local failed", msg)
         return 1
-    _notify_mac("Streamlink Redirect", args.stream + " ready, launching player")
+    _notify_mac("Streamlink 💻 Local",args.stream + " ready, launching player")
 
     print("resolved: " + target)
 
@@ -192,7 +192,7 @@ def main() -> int:
         except OSError as err:
             if port == 0 or attempt == 19:
                 print("error: unable to bind: " + str(err), file=sys.stderr)
-                _notify_mac("Streamlink Redirect failed", "bind error: " + str(err))
+                _notify_mac("Streamlink 💻 Local failed", "bind error: " + str(err))
                 return 1
             port += 1  # try the next specific port when this one is taken
     if srv is None:
