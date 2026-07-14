@@ -1,0 +1,13 @@
+name = "extractor"
+main = "src/worker.js"
+compatibility_date = "2026-07-14"
+
+# AUTH_TOKEN via `wrangler secret put AUTH_TOKEN` — never commit here.
+
+[[d1_databases]]
+binding       = "DB"
+database_name = "extractor"
+database_id   = "REPLACE_ME_AFTER_wrangler_d1_create"
+
+[triggers]
+crons = ["*/1 * * * *"]  # every 1 min (CF minimum). Client can also POST /advance/:id for real-time.

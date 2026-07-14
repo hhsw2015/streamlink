@@ -68,6 +68,10 @@ Qualities: `best`, `2160p`, `1440p`, `1080p`, `720p`, `480p`, `360p`.
 
 macOS notifications keep you posted: "resolving 1080p ...", "1080p ready, launching player", or "failed: <error>".
 
+## Cloud extractor
+
+The extension and the plugin both prefer a Cloudflare Worker that fronts vthreads.top with a shared cache. Live at `https://extractor.bugcf.ccwu.cc`. Source snapshot lives in [`extractor-worker/`](./extractor-worker/) — see its README for how to redeploy your own instance and repoint the extension/plugin at it.
+
 ## Supported sites
 
 The `vthreads` plugin (`src/streamlink/plugins/vthreads.py`) resolves any URL matching its whitelist. Currently:
