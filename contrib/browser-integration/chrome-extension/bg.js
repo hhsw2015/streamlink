@@ -76,6 +76,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!player) return notify("unknown player: " + playerId);
 
   console.log("[streamlink-redirect] clicked", { url, quality, player: player.name });
+  notify(player.name + " " + quality + " → resolving (cloud)");
 
   // Path A: cloud extractor. Return early on success.
   const cloudResult = await tryCloudExtract(url, quality);
@@ -92,6 +93,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   else if (player.app) payload.player = player.app;
 
   console.log("[streamlink-redirect] cloud failed, using native host", payload);
+  notify("cloud unavailable, falling back to local");
   chrome.runtime.sendNativeMessage(HOST, payload, (response) => {
     if (chrome.runtime.lastError) {
       const err = chrome.runtime.lastError.message;
