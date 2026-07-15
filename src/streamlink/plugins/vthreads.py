@@ -278,7 +278,11 @@ def _normalize_quality(label: str) -> str:
     ),
 )
 class VThreads(Plugin):
-    _api_timeout = 30  # override in _try_with_proxy_ips to fail fast on dead IPs
+    # Direct-path timeout: extract POST/GET on the happy path. Long enough for
+    # the vthreads probe (yt-dlp on their side takes 5-20s) but short enough
+    # that a hung upstream doesn't burn a minute before we fall back.
+    # _try_with_proxy_ips overrides this to 8s per proxy attempt.
+    _api_timeout = 15
 
     def __init__(self, session, url):
         super().__init__(session, url)
