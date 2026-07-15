@@ -278,6 +278,8 @@ def _normalize_quality(label: str) -> str:
     ),
 )
 class VThreads(Plugin):
+    _api_timeout = 30  # override in _try_with_proxy_ips to fail fast on dead IPs
+
     def __init__(self, session, url):
         super().__init__(session, url)
         # Fire-and-forget prewarm of the proxy IP pool so the first fallback
@@ -423,45 +425,46 @@ class VThreads(Plugin):
         return {key: stream, "best": stream}
 
     def _api_json(self, url: str, params: dict | None = None):
+        # Rate-limit / server-error handling here is minimal: one quick retry
+        # for transient network hiccups, then bail with a PluginError so the
+        # outer path (proxy IP pool → cloud) can take over. This keeps the
+        # time-to-fallback short (~seconds, not tens of seconds) when vthreads
+        # is throttling us.
         last_err: Exception | None = None
-        for attempt in range(5):
+        for attempt in range(2):
             try:
                 res = self.session.http.get(
                     url,
                     params=params,
                     headers=self._api_headers(),
-                    timeout=60,
+                    timeout=self._api_timeout,
                     raise_for_status=False,
                     retries=0,
                 )
-                if res.status_code == 429:
-                    log.info("vthreads: rate limited, retry in 5s")
-                    time.sleep(5)
-                    continue
+                if res.status_code == 429 or res.status_code == 403 or res.status_code == 1015:
+                    raise PluginError("vthreads: rate limited (HTTP " + str(res.status_code) + ")")
                 if res.status_code >= 500 or res.status_code == 408:
-                    log.info("vthreads: HTTP " + str(res.status_code) + ", retrying")
-                    time.sleep(3)
-                    continue
+                    raise PluginError("vthreads: server error (HTTP " + str(res.status_code) + ")")
                 if res.status_code >= 400:
                     raise PluginError("vthreads: HTTP " + str(res.status_code))
                 return res.json()
             except ValueError as err:
                 raise PluginError("vthreads: non-JSON response") from err
             except PluginError as err:
-                # SSL/connection errors get wrapped as PluginError by session.http; retry those
-                if attempt < 4 and any(k in str(err) for k in ("SSL", "Max retries", "timed out", "Connection")):
+                # Only retry once for transient network errors; anything else
+                # (HTTP 4xx/5xx, rate limit) bubbles up so the fallback layer
+                # can react quickly.
+                msg = str(err)
+                is_transient = any(k in msg for k in ("SSL", "Max retries", "timed out", "Connection"))
+                if attempt == 0 and is_transient:
                     last_err = err
-                    log.info("vthreads: network error, retry " + str(attempt + 1) + "/5")
-                    time.sleep(3)
+                    log.info("vthreads: transient network error, retrying once")
+                    time.sleep(1)
                     continue
                 raise
-            except Exception as err:
-                last_err = err
-                log.info("vthreads: attempt " + str(attempt + 1) + " failed: " + type(err).__name__)
-                time.sleep(3)
-        raise PluginError("vthreads: request failed after 5 attempts: " + (type(last_err).__name__ if last_err else "unknown"))
+        raise PluginError("vthreads: request failed: " + (type(last_err).__name__ if last_err else "unknown"))
 
-    def _try_with_proxy_ips(self, max_attempts: int = 3) -> dict | None:
+    def _try_with_proxy_ips(self, max_attempts: int = 4) -> dict | None:
         """Route the extract call through a rotating proxy-IP DNS override.
         Returns extract data on success, None on total failure. Always leaves
         DNS restored to the original state — later calls (playback / merge)
@@ -469,6 +472,10 @@ class VThreads(Plugin):
         if not proxy_ips.enable():
             log.info("vthreads: proxy IP pool unavailable, skipping")
             return None
+        # Fail fast per attempt: a dead proxy IP shouldn't burn the full 30s
+        # HTTP timeout — we'd rather burn 8s × 4 attempts and move to cloud.
+        original_timeout = self._api_timeout
+        self._api_timeout = 8
         last_err: Exception | None = None
         try:
             for attempt in range(max_attempts):
@@ -482,13 +489,12 @@ class VThreads(Plugin):
                     last_err = err
                     log.info("vthreads: proxy IP " + ip + " failed (" + type(err).__name__ + "), blacklisting")
                     proxy_ips.blacklist(ip)
-                    # Bust this URL's extract cache so the retry hits the network on
-                    # a fresh proxy IP; other URLs' entries stay intact.
                     _cache_delete(_EXTRACT_CACHE_FILE, self.url)
             if last_err:
                 log.info("vthreads: all proxy attempts failed, falling through")
             return None
         finally:
+            self._api_timeout = original_timeout
             proxy_ips.disable()
 
     def _extract(self) -> dict:

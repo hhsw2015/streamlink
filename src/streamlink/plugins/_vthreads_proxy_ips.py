@@ -73,7 +73,7 @@ def _save_cache(data: dict) -> None:
         pass
 
 
-def _fetch_list() -> list[str]:
+def _fetch_list(timeout: float = 5.0) -> list[str]:
     import urllib.request
     req = urllib.request.Request(
         _LIST_URL,
@@ -84,7 +84,7 @@ def _fetch_list() -> list[str]:
             ),
         },
     )
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         text = r.read().decode()
     return [line.strip() for line in text.splitlines() if line.strip() and "." in line]
 
@@ -156,7 +156,7 @@ def _topup_in_background(remaining_ips: list[str], initial: list[str]) -> None:
         pass
 
 
-def refresh(force: bool = False) -> list[str]:
+def refresh(force: bool = False, timeout: float = 5.0) -> list[str]:
     """Return screened proxy IPs. First call blocks only until FAST_QUORUM IPs
     pass screening (~1-3s), then spawns a background thread to fill the pool
     up to TARGET_POOL. Subsequent calls hit the on-disk cache for TTL. Never
@@ -168,7 +168,7 @@ def refresh(force: bool = False) -> list[str]:
         if not force and entry and now - entry.get("fetched_at", 0) < _CACHE_TTL:
             return list(entry.get("ips") or [])
     try:
-        raw_ips = _fetch_list()
+        raw_ips = _fetch_list(timeout=timeout)
     except Exception:
         return list((entry or {}).get("ips") or [])
     if not raw_ips:
@@ -213,7 +213,9 @@ def pick() -> str | None:
             ips = [ip for ip in _HARDCODED_IPS if ip not in blacklist_snapshot]
     if not ips:
         # Everything blacklisted — synchronous refresh is the last resort.
-        fresh = refresh(force=True)
+        # Keep it snappy: if the list API is slow, just give up and let the
+        # caller fall through to the cloud path.
+        fresh = refresh(force=True, timeout=3.0)
         with _lock:
             blacklist_snapshot = frozenset(_blacklist)
         ips = [ip for ip in fresh if ip not in blacklist_snapshot]
