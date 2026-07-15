@@ -51,7 +51,11 @@ _prewarm_thread: threading.Thread | None = None
 _lock = threading.Lock()
 _orig_getaddrinfo = socket.getaddrinfo
 _patched = False
-_blacklist: set[str] = set()
+# IP → epoch-seconds-until-usable-again. Auto-expires so a temporarily flaky
+# IP gets retried after a cooldown instead of being banned for the whole
+# process lifetime.
+_BLACKLIST_TTL = 300.0  # 5 min
+_blacklist: dict[str, float] = {}
 
 
 def _load_cache() -> dict:
@@ -193,8 +197,24 @@ def refresh(force: bool = False, timeout: float = 5.0) -> list[str]:
 
 
 def blacklist(ip: str) -> None:
+    """Mark this IP as unusable for _BLACKLIST_TTL seconds. Auto-expires so
+    an IP that was only briefly flaky can be tried again later."""
     with _lock:
-        _blacklist.add(ip)
+        _blacklist[ip] = time.time() + _BLACKLIST_TTL
+
+
+def _is_blacklisted(ip: str, now: float) -> bool:
+    return _blacklist.get(ip, 0) > now
+
+
+def _live_blacklist_snapshot() -> set[str]:
+    """Return {ip} for IPs still in cooldown right now. Cleans out expired
+    entries as a side effect. Caller must hold `_lock`."""
+    now = time.time()
+    expired = [ip for ip, until in _blacklist.items() if until <= now]
+    for ip in expired:
+        del _blacklist[ip]
+    return set(_blacklist.keys())
 
 
 def pick() -> str | None:
@@ -206,19 +226,17 @@ def pick() -> str | None:
     ips: list[str] = []
     with _lock:
         entry = _load_cache().get("vthreads.top")
-        blacklist_snapshot = frozenset(_blacklist)
+        cooling = _live_blacklist_snapshot()
         if entry:
-            ips = [ip for ip in (entry.get("ips") or []) if ip not in blacklist_snapshot]
+            ips = [ip for ip in (entry.get("ips") or []) if ip not in cooling]
         if not ips:
-            ips = [ip for ip in _HARDCODED_IPS if ip not in blacklist_snapshot]
+            ips = [ip for ip in _HARDCODED_IPS if ip not in cooling]
     if not ips:
         # Everything blacklisted — synchronous refresh is the last resort.
-        # Keep it snappy: if the list API is slow, just give up and let the
-        # caller fall through to the cloud path.
         fresh = refresh(force=True, timeout=3.0)
         with _lock:
-            blacklist_snapshot = frozenset(_blacklist)
-        ips = [ip for ip in fresh if ip not in blacklist_snapshot]
+            cooling = _live_blacklist_snapshot()
+        ips = [ip for ip in fresh if ip not in cooling]
     return random.choice(ips) if ips else None
 
 
@@ -249,12 +267,13 @@ def enable() -> bool:
 
 
 def _has_available_ip_locked() -> bool:
-    """Lock-free check for whether pick() could produce something without a
-    synchronous network call. Caller must already hold `_lock`."""
+    """Whether pick() could produce something without a synchronous network
+    call. Caller must already hold `_lock`."""
+    now = time.time()
     entry = _load_cache().get("vthreads.top")
-    if entry and any(ip not in _blacklist for ip in (entry.get("ips") or [])):
+    if entry and any(not _is_blacklisted(ip, now) for ip in (entry.get("ips") or [])):
         return True
-    return any(ip not in _blacklist for ip in _HARDCODED_IPS)
+    return any(not _is_blacklisted(ip, now) for ip in _HARDCODED_IPS)
 
 
 def disable() -> None:

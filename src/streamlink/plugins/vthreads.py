@@ -283,6 +283,11 @@ class VThreads(Plugin):
     # that a hung upstream doesn't burn a minute before we fall back.
     # _try_with_proxy_ips overrides this to 8s per proxy attempt.
     _api_timeout = 15
+    # In the direct path we do one quick transient retry so a single network
+    # blip doesn't force a fallback. In the proxy-pool path we set this to
+    # False — any error should surface immediately so the current IP gets
+    # blacklisted and the outer loop rotates to the next one.
+    _api_retry_transient = True
 
     def __init__(self, session, url):
         super().__init__(session, url)
@@ -457,10 +462,11 @@ class VThreads(Plugin):
             except PluginError as err:
                 # Only retry once for transient network errors; anything else
                 # (HTTP 4xx/5xx, rate limit) bubbles up so the fallback layer
-                # can react quickly.
+                # can react quickly. In the proxy-pool path we skip the retry
+                # entirely so the current IP gets blacklisted immediately.
                 msg = str(err)
                 is_transient = any(k in msg for k in ("SSL", "Max retries", "timed out", "Connection"))
-                if attempt == 0 and is_transient:
+                if attempt == 0 and is_transient and self._api_retry_transient:
                     last_err = err
                     log.info("vthreads: transient network error, retrying once: " + msg[:200])
                     time.sleep(1)
@@ -478,8 +484,13 @@ class VThreads(Plugin):
             return None
         # Fail fast per attempt: a dead proxy IP shouldn't burn the full 30s
         # HTTP timeout — we'd rather burn 8s × 4 attempts and move to cloud.
+        # Also skip the transient-retry in _api_json so a network error on a
+        # dead IP surfaces immediately and blacklists it, instead of wasting
+        # another 8s retrying the same dead IP.
         original_timeout = self._api_timeout
+        original_retry = self._api_retry_transient
         self._api_timeout = 8
+        self._api_retry_transient = False
         last_err: Exception | None = None
         try:
             for attempt in range(max_attempts):
@@ -499,6 +510,7 @@ class VThreads(Plugin):
             return None
         finally:
             self._api_timeout = original_timeout
+            self._api_retry_transient = original_retry
             proxy_ips.disable()
 
     def _extract(self) -> dict:
