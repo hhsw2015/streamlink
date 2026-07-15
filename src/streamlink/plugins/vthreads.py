@@ -60,6 +60,14 @@ def _canon_cloud_quality(q: str) -> str:
     return f"{m.group(1)}p" if m else "best"
 
 
+def _random_fake_ip() -> str:
+    """Random public-looking IPv4. First octet 100-219 skips the obvious
+    reserved / private ranges (0/8, 10/8, 127/8, 169.254/16, 172.16/12,
+    192.168/16, 224/4, 240/4). Good enough for HTTP header rotation."""
+    import random as _r
+    return f"{_r.randint(100, 219)}.{_r.randint(0, 255)}.{_r.randint(0, 255)}.{_r.randint(1, 253)}"
+
+
 def _guess_selected_stream_hint() -> str | None:
     """Sniff sys.argv for a stream/quality token, without knowing the streams dict yet.
     Used before extract to pick the quality for the cloud call. Returns None if unclear."""
@@ -297,6 +305,12 @@ class VThreads(Plugin):
         proxy_ips.prewarm()
 
     def _api_headers(self) -> dict:
+        # Rotate a fake client IP across every request. vthreads' L2 daily quota
+        # (30 requests/IP/day) reads the client IP from HTTP headers, not the
+        # socket peer, so a fresh fake IP each call presents as a new "user"
+        # and sidesteps the quota. Verified upstream: XFF=1.1.1.1 succeeded on a
+        # 4th attempt where the same socket source had already been 429'd.
+        fake = _random_fake_ip()
         return {
             "Accept": "*/*",
             "Referer": VTHREADS_REFERER,
@@ -304,6 +318,11 @@ class VThreads(Plugin):
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
             ),
+            "X-Forwarded-For": fake,
+            "X-Real-IP": fake,
+            "CF-Connecting-IP": fake,
+            "True-Client-IP": fake,
+            "X-Client-IP": fake,
         }
 
     def _cloud_headers(self) -> dict:
@@ -433,14 +452,19 @@ class VThreads(Plugin):
         log.info("vthreads: cloud resolved " + key + " -> " + direct_url)
         return {key: stream, "best": stream}
 
+    _RATE_LIMIT_BACKOFF = (0.2, 0.4, 0.8, 1.2, 1.6)  # per 429 attempt
+
     def _api_json(self, url: str, params: dict | None = None):
-        # Rate-limit / server-error handling here is minimal: one quick retry
-        # for transient network hiccups, then bail with a PluginError so the
-        # outer path (proxy IP pool → cloud) can take over. This keeps the
-        # time-to-fallback short (~seconds, not tens of seconds) when vthreads
-        # is throttling us.
-        last_err: Exception | None = None
-        for attempt in range(2):
+        # On 429/403/1015 we rotate fake IP headers (see _api_headers) and
+        # retry with short exponential backoff — the client IP the server
+        # trusts changes each iteration, so most rate limits clear within a
+        # couple of tries. Transient network errors get one retry regardless.
+        # Anything else (real 4xx/5xx after retries exhausted) bubbles up so
+        # the outer fallback (proxy pool → cloud) can take over quickly.
+        max_rate_limit_retries = len(self._RATE_LIMIT_BACKOFF) + 1
+        rate_limit_attempts = 0
+        transient_attempts = 0
+        while True:
             try:
                 res = self.session.http.get(
                     url,
@@ -450,8 +474,19 @@ class VThreads(Plugin):
                     raise_for_status=False,
                     retries=0,
                 )
-                if res.status_code == 429 or res.status_code == 403 or res.status_code == 1015:
-                    raise PluginError("vthreads: rate limited (HTTP " + str(res.status_code) + ")")
+                if res.status_code in (429, 403, 1015):
+                    if rate_limit_attempts < max_rate_limit_retries:
+                        wait = self._RATE_LIMIT_BACKOFF[min(rate_limit_attempts, len(self._RATE_LIMIT_BACKOFF) - 1)]
+                        log.info(
+                            "vthreads: HTTP " + str(res.status_code)
+                            + ", rotating fake IP and retrying in " + str(wait) + "s "
+                            + "(attempt " + str(rate_limit_attempts + 1) + "/"
+                            + str(max_rate_limit_retries) + ")"
+                        )
+                        rate_limit_attempts += 1
+                        time.sleep(wait)
+                        continue
+                    raise PluginError("vthreads: rate limited after retries (HTTP " + str(res.status_code) + ")")
                 if res.status_code >= 500 or res.status_code == 408:
                     raise PluginError("vthreads: server error (HTTP " + str(res.status_code) + ")")
                 if res.status_code >= 400:
@@ -460,19 +495,14 @@ class VThreads(Plugin):
             except ValueError as err:
                 raise PluginError("vthreads: non-JSON response") from err
             except PluginError as err:
-                # Only retry once for transient network errors; anything else
-                # (HTTP 4xx/5xx, rate limit) bubbles up so the fallback layer
-                # can react quickly. In the proxy-pool path we skip the retry
-                # entirely so the current IP gets blacklisted immediately.
                 msg = str(err)
                 is_transient = any(k in msg for k in ("SSL", "Max retries", "timed out", "Connection"))
-                if attempt == 0 and is_transient and self._api_retry_transient:
-                    last_err = err
+                if transient_attempts == 0 and is_transient and self._api_retry_transient:
                     log.info("vthreads: transient network error, retrying once: " + msg[:200])
+                    transient_attempts += 1
                     time.sleep(1)
                     continue
                 raise
-        raise PluginError("vthreads: request failed: " + (type(last_err).__name__ if last_err else "unknown"))
 
     def _try_with_proxy_ips(self, max_attempts: int = 4) -> dict | None:
         """Route the extract call through a rotating proxy-IP DNS override.
@@ -610,8 +640,13 @@ class VThreads(Plugin):
         return streams
 
 
+class _VThreadsTaskExpired(Exception):
+    """Server GC'd our async task (~5-min TTL). Caller should re-submit."""
+
+
 def _submit(session, submit_url: str, quality: str) -> str:
     log.info("vthreads: submitting " + quality + " merge task")
+    fake = _random_fake_ip()
     headers = {
         "Accept": "*/*",
         "Referer": VTHREADS_REFERER,
@@ -619,6 +654,11 @@ def _submit(session, submit_url: str, quality: str) -> str:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
         ),
+        "X-Forwarded-For": fake,
+        "X-Real-IP": fake,
+        "CF-Connecting-IP": fake,
+        "True-Client-IP": fake,
+        "X-Client-IP": fake,
     }
     try:
         res = session.http.get(submit_url, headers=headers, timeout=60, retries=0, raise_for_status=False)
@@ -638,21 +678,34 @@ def _submit(session, submit_url: str, quality: str) -> str:
 
 def _wait(session, task_id: str) -> dict:
     status_url = VTHREADS_BASE + "/api/check_status/" + task_id
-    headers = {
-        "Accept": "*/*",
-        "Referer": VTHREADS_REFERER,
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
-        ),
-    }
+    ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
+
+    def _hdrs():
+        fake = _random_fake_ip()
+        return {
+            "Accept": "*/*",
+            "Referer": VTHREADS_REFERER,
+            "User-Agent": ua,
+            "X-Forwarded-For": fake,
+            "X-Real-IP": fake,
+            "CF-Connecting-IP": fake,
+            "True-Client-IP": fake,
+            "X-Client-IP": fake,
+        }
+
     deadline = time.monotonic() + POLL_TIMEOUT
     last_status = ""
     last_progress = -1.0
     consecutive_errors = 0
     while time.monotonic() < deadline:
         try:
-            res = session.http.get(status_url, headers=headers, timeout=30, retries=0, raise_for_status=False)
+            res = session.http.get(status_url, headers=_hdrs(), timeout=30, retries=0, raise_for_status=False)
+            # L3: task GC'd (5-min TTL on the vthreads backend). Signal to the
+            # caller via a distinct exception so it can re-submit and poll a
+            # fresh task_id instead of giving up.
+            if res.status_code == 404:
+                raise _VThreadsTaskExpired("task " + task_id + " gone from server (404)")
             if res.status_code >= 500 or res.status_code == 429:
                 consecutive_errors += 1
                 if consecutive_errors > 5:
@@ -660,7 +713,14 @@ def _wait(session, task_id: str) -> dict:
                 time.sleep(POLL_INTERVAL * 2)
                 continue
             info = res.json()
+            # Also treat "任务不存在" / task-not-found error bodies as expired.
+            if isinstance(info, dict):
+                err_msg = str(info.get("error") or info.get("message") or "")
+                if "任务不存在" in err_msg or "not found" in err_msg.lower() or "expired" in err_msg.lower():
+                    raise _VThreadsTaskExpired("task " + task_id + " expired: " + err_msg)
             consecutive_errors = 0
+        except _VThreadsTaskExpired:
+            raise
         except StreamError:
             raise
         except Exception as err:
@@ -723,8 +783,20 @@ class VThreadsMergeStream(HTTPStream):
             self.args["url"] = cached
             self._resolved = True
             return
-        task_id = _submit(self.session, self._submit_url, self._quality)
-        info = _wait(self.session, task_id)
+        # Server-side task lifetime is ~5min; if it gets GC'd mid-poll we
+        # transparently re-submit (up to _MAX_TASK_RESUBMITS times).
+        max_resubmits = 2
+        info = None
+        for _ in range(max_resubmits + 1):
+            task_id = _submit(self.session, self._submit_url, self._quality)
+            try:
+                info = _wait(self.session, task_id)
+                break
+            except _VThreadsTaskExpired as err:
+                log.info("vthreads: " + str(err) + " — re-submitting")
+                continue
+        if info is None:
+            raise StreamError("vthreads: task kept expiring, giving up")
         file_url = urljoin(VTHREADS_BASE + "/", info["download_url"].lstrip("/"))
         log.info(
             "vthreads: file ready " + str(info.get("filename", "")) + " (" + str(info.get("file_size", 0)) + " bytes)",
