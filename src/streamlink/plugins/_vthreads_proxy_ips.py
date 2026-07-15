@@ -95,13 +95,18 @@ def _fetch_list(timeout: float = 5.0) -> list[str]:
 
 
 def _screen_one(ip: str, host: str = "vthreads.top") -> bool:
-    """Return True if the IP accepts a TCP connection on 443.
-    We deliberately skip TLS here for speed (~200-500ms vs ~1-2s); real requests
-    that later fail via TLS/HTTP get the IP blacklisted at the call site."""
+    """Return True if we can TLS-handshake to `ip:443` using `host` as SNI.
+    A TCP-only probe would let dead-path IPs through (network reaches the
+    edge but TLS terminates on some other cert / GFW rewrites SNI); the
+    full handshake weeds those out at ~500-1500ms per IP."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False  # we only care that TLS completes, not cert CN match
+    ctx.verify_mode = ssl.CERT_NONE
     try:
-        with socket.create_connection((ip, 443), timeout=_SCREEN_TIMEOUT):
-            return True
-    except (OSError, TimeoutError):
+        with socket.create_connection((ip, 443), timeout=_SCREEN_TIMEOUT) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                return tls.version() is not None
+    except (OSError, ssl.SSLError, TimeoutError):
         return False
 
 
@@ -160,6 +165,21 @@ def _topup_in_background(remaining_ips: list[str], initial_count: int) -> None:
             _save_cache(cache)
     except Exception:
         pass
+
+
+def _prescreen_hardcoded_locked() -> list[str]:
+    """Blacklist hardcoded IPs that fail a TLS handshake right now. Returns
+    the survivors, so the caller can trust `_HARDCODED_IPS` after filtering.
+    Runs in parallel — only ~500ms in the common case."""
+    now = time.monotonic()
+    candidates = [ip for ip in _HARDCODED_IPS if not _is_blacklisted(ip, now)]
+    if not candidates:
+        return []
+    good = _screen(candidates, target=len(candidates))
+    dead = set(candidates) - set(good)
+    for ip in dead:
+        _blacklist[ip] = time.monotonic() + _BLACKLIST_TTL
+    return good
 
 
 def refresh(force: bool = False, timeout: float = 5.0) -> list[str]:
@@ -314,6 +334,11 @@ def prewarm() -> None:
 
     def _run():
         try:
+            # First blacklist any hardcoded seeds that are already unreachable so
+            # pick() doesn't hand out dead IPs while the fresh refresh is
+            # in flight.
+            with _lock:
+                _prescreen_hardcoded_locked()
             refresh()
         except Exception:
             pass
