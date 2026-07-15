@@ -34,15 +34,21 @@ const DEFAULT_QUALITY = "best";
 const MODE_KEY = "sl_mode";
 let currentMode = "cloud";
 
-async function loadMode() {
-  const stored = await chrome.storage.local.get(MODE_KEY);
+async function loadMode({ rebuildIfChanged = true } = {}) {
+  let stored;
+  try {
+    stored = await chrome.storage.local.get(MODE_KEY);
+  } catch (e) {
+    console.warn("[streamlink-redirect] loadMode: storage.get failed:", e);
+    return; // keep previous in-memory value
+  }
   const before = currentMode;
   if (stored[MODE_KEY] === "cloud" || stored[MODE_KEY] === "local") {
     currentMode = stored[MODE_KEY];
   }
-  // If the effective mode actually changed (worker was respawned with a stale
-  // default), keep the menu labels in sync.
-  if (before !== currentMode) {
+  // Only rebuild menus when we know we're not inside a click handler —
+  // rebuilding menus during a click is a race that can drop the click.
+  if (rebuildIfChanged && before !== currentMode) {
     try { await rebuildMenus(); } catch (_) {}
   }
 }
@@ -123,7 +129,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   // handle a click, module-level `currentMode` is re-initialised to its
   // default ("cloud") instead of the user's persisted choice. Reload from
   // storage on every click so the mode setting is actually respected.
-  await loadMode();
+  // Suppress the auto-rebuild — we're inside a click handler, mutating
+  // context menus mid-click would drop the current invocation.
+  await loadMode({ rebuildIfChanged: false });
 
   // Mode switch clicks — no URL involved.
   if (info.menuItemId === "sl-mode-cloud") return setMode("cloud");
