@@ -272,6 +272,13 @@ def _normalize_quality(label: str) -> str:
     ),
 )
 class VThreads(Plugin):
+    def __init__(self, session, url):
+        super().__init__(session, url)
+        # Fire-and-forget prewarm of the proxy IP pool so the first fallback
+        # attempt (if direct fails) doesn't pay setup latency. Safe to call every
+        # time — proxy_ips.prewarm() self-guards against duplicate work.
+        proxy_ips.prewarm()
+
     def _api_headers(self) -> dict:
         return {
             "Accept": "*/*",

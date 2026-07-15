@@ -25,11 +25,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 _LIST_URL = "https://ipdb.api.030101.xyz/?type=bestproxy"
 _CACHE_FILE = os.path.expanduser("~/.cache/streamlink-vthreads/proxy_ips.json")
 _CACHE_TTL = 30 * 60           # 30 min — refresh list this often
-_SCREEN_TIMEOUT = 2.0          # seconds per IP TLS handshake test
+_SCREEN_TIMEOUT = 1.5          # seconds — TCP connect only, no TLS
 _SCREEN_WORKERS = 30           # parallel probes
-_MIN_ALIVE = 3                 # fewer survivors → pool unusable
-_FAST_QUORUM = 3               # return as soon as this many IPs pass screening
-_TARGET_POOL = 10              # keep screening in background until we have this many
+_MIN_ALIVE = 2                 # fewer survivors → pool unusable
+_FAST_QUORUM = 2               # return as soon as this many pass screening
+_TARGET_POOL = 10              # background thread grows the pool to this size
+
+# Background prewarm: kicks off on first import so first real use has no wait
+_prewarm_started = False
+_prewarm_thread: threading.Thread | None = None
 
 _lock = threading.Lock()
 _orig_getaddrinfo = socket.getaddrinfo
@@ -73,13 +77,13 @@ def _fetch_list() -> list[str]:
 
 
 def _screen_one(ip: str, host: str = "vthreads.top") -> bool:
-    """Return True if we can complete a TLS handshake to `ip` with SNI=host."""
-    ctx = ssl.create_default_context()
+    """Return True if the IP accepts a TCP connection on 443.
+    We deliberately skip TLS here for speed (~200-500ms vs ~1-2s); real requests
+    that later fail via TLS/HTTP get the IP blacklisted at the call site."""
     try:
-        with socket.create_connection((ip, 443), timeout=_SCREEN_TIMEOUT) as raw:
-            with ctx.wrap_socket(raw, server_hostname=host) as tls:
-                return tls.version() is not None
-    except (OSError, ssl.SSLError, TimeoutError):
+        with socket.create_connection((ip, 443), timeout=_SCREEN_TIMEOUT):
+            return True
+    except (OSError, TimeoutError):
         return False
 
 
@@ -217,3 +221,39 @@ def disable() -> None:
         if _patched:
             socket.getaddrinfo = _orig_getaddrinfo
             _patched = False
+
+
+def prewarm() -> None:
+    """Kick off refresh() on a background daemon thread so the first real request
+    that needs a proxy IP has an already-primed pool. Safe to call many times —
+    only the first call actually starts the thread. Callable from module init or
+    from the plugin at construction time."""
+    global _prewarm_started, _prewarm_thread
+    if os.environ.get("VTHREADS_USE_PROXY_IPS", "1") not in ("1", "true", "yes"):
+        return
+    with _lock:
+        if _prewarm_started:
+            return
+        # If cache is still fresh, there is nothing to prewarm.
+        entry = _load_cache().get("vthreads.top")
+        if entry and time.time() - entry.get("fetched_at", 0) < _CACHE_TTL and entry.get("ips"):
+            _prewarm_started = True
+            return
+        _prewarm_started = True
+
+    def _run():
+        try:
+            refresh()
+        except Exception:
+            pass
+
+    _prewarm_thread = threading.Thread(target=_run, daemon=True, name="vthreads-proxy-prewarm")
+    _prewarm_thread.start()
+
+
+def wait_for_prewarm(timeout: float = 2.0) -> None:
+    """Block up to `timeout` seconds for the prewarm thread. If prewarm was never
+    started or has already finished, returns immediately."""
+    t = _prewarm_thread
+    if t is not None:
+        t.join(timeout=timeout)
