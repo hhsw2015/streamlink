@@ -206,13 +206,17 @@ def pick() -> str | None:
     ips: list[str] = []
     with _lock:
         entry = _load_cache().get("vthreads.top")
+        blacklist_snapshot = frozenset(_blacklist)
         if entry:
-            ips = [ip for ip in (entry.get("ips") or []) if ip not in _blacklist]
-    if not ips:
-        ips = [ip for ip in _HARDCODED_IPS if ip not in _blacklist]
+            ips = [ip for ip in (entry.get("ips") or []) if ip not in blacklist_snapshot]
+        if not ips:
+            ips = [ip for ip in _HARDCODED_IPS if ip not in blacklist_snapshot]
     if not ips:
         # Everything blacklisted — synchronous refresh is the last resort.
-        ips = [ip for ip in refresh(force=True) if ip not in _blacklist]
+        fresh = refresh(force=True)
+        with _lock:
+            blacklist_snapshot = frozenset(_blacklist)
+        ips = [ip for ip in fresh if ip not in blacklist_snapshot]
     return random.choice(ips) if ips else None
 
 
@@ -228,16 +232,27 @@ def _patched_getaddrinfo(host, port, *args, **kwargs):
 def enable() -> bool:
     """Install the DNS override. Never blocks on the network — hardcoded IPs
     seed the pool immediately, background refresh replaces them within seconds.
-    Returns True unless every hardcoded IP has been blacklisted this session."""
+    Returns True as long as some IP is theoretically available (hardcoded not
+    fully exhausted OR cache non-empty)."""
     global _patched
     with _lock:
         if _patched:
-            return True
+            return _has_available_ip_locked()
         socket.getaddrinfo = _patched_getaddrinfo
         _patched = True
+        available = _has_available_ip_locked()
     # nudge a background refresh so the disk cache catches up
     prewarm()
-    return pick() is not None
+    return available
+
+
+def _has_available_ip_locked() -> bool:
+    """Lock-free check for whether pick() could produce something without a
+    synchronous network call. Caller must already hold `_lock`."""
+    entry = _load_cache().get("vthreads.top")
+    if entry and any(ip not in _blacklist for ip in (entry.get("ips") or [])):
+        return True
+    return any(ip not in _blacklist for ip in _HARDCODED_IPS)
 
 
 def disable() -> None:

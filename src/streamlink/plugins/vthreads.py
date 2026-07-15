@@ -142,6 +142,12 @@ def _cache_get(path: str, key: str, ttl: float):
     return value
 
 
+def _cache_delete(path: str, key: str) -> None:
+    data = _cache_load(path)
+    if data.pop(key, None) is not None:
+        _cache_save(path, data)
+
+
 def _cache_put(path: str, key: str, value) -> None:
     data = _cache_load(path)
     data[key] = [time.time(), value]
@@ -457,34 +463,33 @@ class VThreads(Plugin):
 
     def _try_with_proxy_ips(self, max_attempts: int = 3) -> dict | None:
         """Route the extract call through a rotating proxy-IP DNS override.
-        Returns extract data on success, None on total failure — caller falls
-        back to direct + cloud. Never raises."""
+        Returns extract data on success, None on total failure. Always leaves
+        DNS restored to the original state — later calls (playback / merge)
+        make their own decision about which path to use."""
         if not proxy_ips.enable():
             log.info("vthreads: proxy IP pool unavailable, skipping")
             return None
         last_err: Exception | None = None
-        for attempt in range(max_attempts):
-            ip = proxy_ips.pick()
-            if not ip:
-                break
-            log.info("vthreads: attempt " + str(attempt + 1) + " via proxy IP " + ip)
-            try:
-                data = self._extract()
-                return data
-            except Exception as err:
-                last_err = err
-                log.info("vthreads: proxy IP " + ip + " failed (" + type(err).__name__ + "), blacklisting")
-                proxy_ips.blacklist(ip)
-                # bust extract cache so the retry actually hits the network
+        try:
+            for attempt in range(max_attempts):
+                ip = proxy_ips.pick()
+                if not ip:
+                    break
+                log.info("vthreads: attempt " + str(attempt + 1) + " via proxy IP " + ip)
                 try:
-                    os.remove(_EXTRACT_CACHE_FILE)
-                except OSError:
-                    pass
-        if last_err:
-            log.info("vthreads: all proxy attempts failed, falling through")
-        # Restore normal DNS so the direct-fallback + cloud paths use real vthreads DNS
-        proxy_ips.disable()
-        return None
+                    return self._extract()
+                except Exception as err:
+                    last_err = err
+                    log.info("vthreads: proxy IP " + ip + " failed (" + type(err).__name__ + "), blacklisting")
+                    proxy_ips.blacklist(ip)
+                    # Bust this URL's extract cache so the retry hits the network on
+                    # a fresh proxy IP; other URLs' entries stay intact.
+                    _cache_delete(_EXTRACT_CACHE_FILE, self.url)
+            if last_err:
+                log.info("vthreads: all proxy attempts failed, falling through")
+            return None
+        finally:
+            proxy_ips.disable()
 
     def _extract(self) -> dict:
         cached = _cache_get(_EXTRACT_CACHE_FILE, self.url, _EXTRACT_CACHE_TTL)
