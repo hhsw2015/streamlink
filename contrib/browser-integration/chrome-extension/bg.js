@@ -6,7 +6,8 @@ const HOST = "com.streamlink.redirect";
 const CLOUD_BASE = "https://extractor.bugcf.ccwu.cc";
 const CLOUD_TOKEN = "test-token-2026-extractor";
 const CLOUD_POLL_INTERVAL_MS = 2000;
-const CLOUD_POLL_MAX_TRIES = 90;
+const CLOUD_POLL_MAX_TRIES = 45;         // 45 × 2s = 90s ceiling before we bail to local
+const CLOUD_SUBMIT_TIMEOUT_MS = 15000;   // submit POST hard-abort so cloud outages don't hang
 
 // URL scheme templates adapted from OpenList's player list. macOS-friendly players only.
 // $edurl = percent-encoded resolved video URL. $durl = raw. See src/streamlink_cli/redirect.py.
@@ -27,15 +28,37 @@ const QUALITIES = ["best", "2160p", "1440p", "1080p", "720p", "480p", "360p"];
 const DEFAULT_PLAYER_ID = "iina";
 const DEFAULT_QUALITY = "best";
 
-chrome.runtime.onInstalled.addListener(() => {
+// Mode: "cloud" (default, browser calls cloud extractor first) or "local"
+// (skip cloud entirely, hand URL to native host which uses local vthreads).
+// Persisted in chrome.storage.local, toggleable from the context menu.
+const MODE_KEY = "sl_mode";
+let currentMode = "cloud";
+
+async function loadMode() {
+  const stored = await chrome.storage.local.get(MODE_KEY);
+  if (stored[MODE_KEY] === "cloud" || stored[MODE_KEY] === "local") {
+    currentMode = stored[MODE_KEY];
+  }
+}
+
+async function setMode(mode) {
+  currentMode = mode;
+  await chrome.storage.local.set({ [MODE_KEY]: mode });
+  await rebuildMenus();
+  notify("switched to " + mode + " mode", mode === "cloud" ? "Cloud" : "Local");
+}
+
+async function rebuildMenus() {
+  await chrome.contextMenus.removeAll();
+  const modeLabel = currentMode === "cloud" ? "☁ cloud" : "💻 local";
   chrome.contextMenus.create({
     id: "sl-quick",
-    title: "Open in Streamlink (IINA, best)",
+    title: `Open in Streamlink (${modeLabel}, IINA, best)`,
     contexts: ["link", "page", "video", "selection"],
   });
   chrome.contextMenus.create({
     id: "sl-root",
-    title: "Open in Streamlink...",
+    title: `Open in Streamlink... (${modeLabel})`,
     contexts: ["link", "page", "video", "selection"],
   });
   for (const p of PLAYERS) {
@@ -54,9 +77,46 @@ chrome.runtime.onInstalled.addListener(() => {
       });
     }
   }
+  // Mode switch submenu — clearly labelled so you know which entry is active.
+  chrome.contextMenus.create({
+    id: "sl-sep",
+    parentId: "sl-root",
+    type: "separator",
+    contexts: ["link", "page", "video", "selection"],
+  });
+  chrome.contextMenus.create({
+    id: "sl-mode-cloud",
+    parentId: "sl-root",
+    type: "radio",
+    checked: currentMode === "cloud",
+    title: "Mode: ☁ Cloud first (fallback: local)",
+    contexts: ["link", "page", "video", "selection"],
+  });
+  chrome.contextMenus.create({
+    id: "sl-mode-local",
+    parentId: "sl-root",
+    type: "radio",
+    checked: currentMode === "local",
+    title: "Mode: 💻 Local only (skip cloud)",
+    contexts: ["link", "page", "video", "selection"],
+  });
+}
+
+chrome.runtime.onInstalled.addListener(async () => {
+  await loadMode();
+  await rebuildMenus();
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await loadMode();
+  await rebuildMenus();
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  // Mode switch clicks — no URL involved.
+  if (info.menuItemId === "sl-mode-cloud") return setMode("cloud");
+  if (info.menuItemId === "sl-mode-local") return setMode("local");
+
   const url = info.linkUrl || info.srcUrl || info.pageUrl || (tab && tab.url);
   if (!url) return notify("no URL to open");
 
@@ -75,10 +135,19 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   const player = PLAYERS.find((p) => p.id === playerId);
   if (!player) return notify("unknown player: " + playerId);
 
-  console.log("[streamlink-redirect] clicked", { url, quality, player: player.name });
-  notify(player.name + " " + quality + " → resolving (cloud)");
+  console.log("[streamlink-redirect] clicked", { url, quality, player: player.name, mode: currentMode });
 
-  // Path A: cloud extractor. Return early on success.
+  // Local-only mode: hand straight to the native host, cloud never touched.
+  if (currentMode === "local") {
+    notify(player.name + " " + quality + " → resolving (local)", "Local");
+    const payload = { url, quality, skip_cloud: true };
+    if (player.scheme) payload.scheme = player.scheme;
+    else if (player.app) payload.player = player.app;
+    return sendToHost(payload, player, quality, "Local");
+  }
+
+  // Cloud-first mode: try cloud, fall back to local on any failure/timeout.
+  notify(player.name + " " + quality + " → resolving (cloud)");
   const cloudResult = await tryCloudExtract(url, quality);
   if (cloudResult && cloudResult.direct_url) {
     notify(player.name + " " + quality + " → launching (cloud)");
@@ -86,39 +155,49 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     return;
   }
 
-  // Path B: local streamlink-redirect via native host. Extension already tried cloud
-  // and failed, so tell the plugin to skip cloud (VTHREADS_SKIP_CLOUD=1).
+  // Cloud failed → local fallback (native host, skip_cloud so we don't loop).
   const payload = { url, quality, skip_cloud: true };
   if (player.scheme) payload.scheme = player.scheme;
   else if (player.app) payload.player = player.app;
-
   console.log("[streamlink-redirect] cloud failed, using native host", payload);
   notify("cloud unavailable, falling back to local", "Local");
+  return sendToHost(payload, player, quality, "Local");
+});
+
+function sendToHost(payload, player, quality, subtitle) {
   chrome.runtime.sendNativeMessage(HOST, payload, (response) => {
     if (chrome.runtime.lastError) {
       const err = chrome.runtime.lastError.message;
       console.error("[streamlink-redirect] native error:", err);
-      notify("host error: " + err, "Local");
+      notify("host error: " + err, subtitle);
       return;
     }
     if (!response || !response.ok) {
-      notify("failed: " + (response && response.error ? response.error : "unknown"), "Local");
+      notify("failed: " + (response && response.error ? response.error : "unknown"), subtitle);
       return;
     }
-    notify(player.name + " " + quality + " → launching (local, pid " + response.pid + ")", "Local");
+    notify(player.name + " " + quality + " → launching (local, pid " + response.pid + ")", subtitle);
   });
-});
+}
 
 async function tryCloudExtract(sourceUrl, quality) {
   const cloudQuality = canonCloudQuality(quality);
   const tag = `[cloud ${cloudQuality}]`;
   console.log(tag, "POST", `${CLOUD_BASE}/extract`, {source_url: sourceUrl, quality: cloudQuality});
   try {
-    const submitRes = await fetch(`${CLOUD_BASE}/extract`, {
-      method: "POST",
-      headers: { "X-Auth": CLOUD_TOKEN, "Content-Type": "application/json" },
-      body: JSON.stringify({ source_url: sourceUrl, quality: cloudQuality }),
-    });
+    const submitCtrl = new AbortController();
+    const submitTimer = setTimeout(() => submitCtrl.abort(), CLOUD_SUBMIT_TIMEOUT_MS);
+    let submitRes;
+    try {
+      submitRes = await fetch(`${CLOUD_BASE}/extract`, {
+        method: "POST",
+        headers: { "X-Auth": CLOUD_TOKEN, "Content-Type": "application/json" },
+        body: JSON.stringify({ source_url: sourceUrl, quality: cloudQuality }),
+        signal: submitCtrl.signal,
+      });
+    } finally {
+      clearTimeout(submitTimer);
+    }
     console.log(tag, "submit response status =", submitRes.status);
     const submitText = await submitRes.text();
     console.log(tag, "submit body =", submitText.slice(0, 500));

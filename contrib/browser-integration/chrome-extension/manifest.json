@@ -3,7 +3,7 @@
   "name": "Streamlink Redirect",
   "version": "0.1.0",
   "description": "Right-click a video page or link to play it via streamlink-redirect.",
-  "permissions": ["contextMenus", "nativeMessaging", "notifications"],
+  "permissions": ["contextMenus", "nativeMessaging", "notifications", "storage"],
   "background": {
     "service_worker": "bg.js"
   },
