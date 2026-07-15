@@ -36,8 +36,14 @@ let currentMode = "cloud";
 
 async function loadMode() {
   const stored = await chrome.storage.local.get(MODE_KEY);
+  const before = currentMode;
   if (stored[MODE_KEY] === "cloud" || stored[MODE_KEY] === "local") {
     currentMode = stored[MODE_KEY];
+  }
+  // If the effective mode actually changed (worker was respawned with a stale
+  // default), keep the menu labels in sync.
+  if (before !== currentMode) {
+    try { await rebuildMenus(); } catch (_) {}
   }
 }
 
@@ -113,6 +119,12 @@ chrome.runtime.onStartup.addListener(async () => {
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  // MV3 service workers get killed after ~30s of idle. When they respawn to
+  // handle a click, module-level `currentMode` is re-initialised to its
+  // default ("cloud") instead of the user's persisted choice. Reload from
+  // storage on every click so the mode setting is actually respected.
+  await loadMode();
+
   // Mode switch clicks — no URL involved.
   if (info.menuItemId === "sl-mode-cloud") return setMode("cloud");
   if (info.menuItemId === "sl-mode-local") return setMode("local");
