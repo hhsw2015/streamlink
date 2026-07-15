@@ -458,7 +458,7 @@ class VThreads(Plugin):
                 is_transient = any(k in msg for k in ("SSL", "Max retries", "timed out", "Connection"))
                 if attempt == 0 and is_transient:
                     last_err = err
-                    log.info("vthreads: transient network error, retrying once")
+                    log.info("vthreads: transient network error, retrying once: " + msg[:200])
                     time.sleep(1)
                     continue
                 raise
