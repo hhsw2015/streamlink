@@ -287,11 +287,17 @@ function sleep(ms) {
 // 1x1 dark-gray PNG (chrome.notifications rejects SVG data-URLs — needs a real bitmap).
 const NOTIFY_ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
-function notify(message, subtitle = "Cloud") {
+function notify(message, subtitle) {
+  // Default subtitle tracks the current mode so a Local-only session never
+  // sees a "☁ Cloud" title.
+  if (!subtitle) {
+    subtitle = currentMode === "local" ? "Local" : "Cloud";
+  }
+  const glyph = subtitle === "Local" ? "💻" : "☁";
   chrome.notifications.create({
     type: "basic",
     iconUrl: NOTIFY_ICON,
-    title: "Streamlink ☁ " + subtitle,
+    title: "Streamlink " + glyph + " " + subtitle,
     message,
   });
 }
