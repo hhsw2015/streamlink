@@ -51,6 +51,7 @@ _prewarm_thread: threading.Thread | None = None
 _lock = threading.Lock()
 _orig_getaddrinfo = socket.getaddrinfo
 _patched = False
+_patch_refcount = 0  # nested enable() calls must all disable() before we unpatch
 # IP → epoch-seconds-until-usable-again. Auto-expires so a temporarily flaky
 # IP gets retried after a cooldown instead of being banned for the whole
 # process lifetime.
@@ -104,48 +105,49 @@ def _screen_one(ip: str, host: str = "vthreads.top") -> bool:
         return False
 
 
-def _screen_first(ips: list[str], quorum: int = _FAST_QUORUM) -> list[str]:
-    """Return as soon as `quorum` IPs pass screening. Blocks up to a few seconds."""
+def _screen(ips: list[str], target: int) -> list[str]:
+    """Return as soon as `target` IPs pass a TCP screen. Does NOT wait for
+    in-flight probes to finish once the quorum is reached — the pool is
+    shut down with wait=False so the caller unblocks in ~200-500ms even
+    if some probes still have 1.5s of timeout left to burn."""
     good: list[str] = []
-    with ThreadPoolExecutor(max_workers=_SCREEN_WORKERS) as ex:
+    ex = ThreadPoolExecutor(max_workers=_SCREEN_WORKERS)
+    try:
         futures = {ex.submit(_screen_one, ip): ip for ip in ips}
         for fut in as_completed(futures):
             ip = futures[fut]
             try:
                 if fut.result():
                     good.append(ip)
-                    if len(good) >= quorum:
-                        for f in futures:
-                            f.cancel()
+                    if len(good) >= target:
                         break
             except Exception:
                 pass
+    finally:
+        # wait=False on Python 3.9+; older versions still return promptly
+        # because the daemon threads holding sockets don't block interpreter exit.
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            ex.shutdown(wait=False)
     return good
+
+
+def _screen_first(ips: list[str], quorum: int = _FAST_QUORUM) -> list[str]:
+    return _screen(ips, quorum)
 
 
 def _screen_full(ips: list[str], keep: int = _TARGET_POOL) -> list[str]:
-    """Screen every IP until `keep` survive. Used by the background top-up thread."""
-    good: list[str] = []
-    with ThreadPoolExecutor(max_workers=_SCREEN_WORKERS) as ex:
-        futures = {ex.submit(_screen_one, ip): ip for ip in ips}
-        for fut in as_completed(futures):
-            ip = futures[fut]
-            try:
-                if fut.result():
-                    good.append(ip)
-                    if len(good) >= keep:
-                        for f in futures:
-                            f.cancel()
-                        break
-            except Exception:
-                pass
-    return good
+    return _screen(ips, keep)
 
 
-def _topup_in_background(remaining_ips: list[str], initial: list[str]) -> None:
-    """Screen the rest and merge into cache so the pool grows without blocking the caller."""
+def _topup_in_background(remaining_ips: list[str], initial_count: int) -> None:
+    """Screen the rest and merge into cache so the pool grows without blocking
+    the caller. `initial_count` tells us how many good IPs are already stored
+    so we only screen enough to hit _TARGET_POOL."""
     try:
-        extras = _screen_full(remaining_ips, keep=_TARGET_POOL - len(initial))
+        need = max(1, _TARGET_POOL - initial_count)
+        extras = _screen_full(remaining_ips, keep=need)
         if not extras:
             return
         with _lock:
@@ -188,7 +190,7 @@ def refresh(force: bool = False, timeout: float = 5.0) -> list[str]:
     if remaining and len(fast) < _TARGET_POOL:
         t = threading.Thread(
             target=_topup_in_background,
-            args=(remaining, fast),
+            args=(remaining, len(fast)),
             daemon=True,
             name="vthreads-proxy-topup",
         )
@@ -198,9 +200,11 @@ def refresh(force: bool = False, timeout: float = 5.0) -> list[str]:
 
 def blacklist(ip: str) -> None:
     """Mark this IP as unusable for _BLACKLIST_TTL seconds. Auto-expires so
-    an IP that was only briefly flaky can be tried again later."""
+    an IP that was only briefly flaky can be tried again later. Uses
+    monotonic time so clock jumps (NTP, sleep/wake) don't corrupt the
+    cooldown window."""
     with _lock:
-        _blacklist[ip] = time.time() + _BLACKLIST_TTL
+        _blacklist[ip] = time.monotonic() + _BLACKLIST_TTL
 
 
 def _is_blacklisted(ip: str, now: float) -> bool:
@@ -210,7 +214,7 @@ def _is_blacklisted(ip: str, now: float) -> bool:
 def _live_blacklist_snapshot() -> set[str]:
     """Return {ip} for IPs still in cooldown right now. Cleans out expired
     entries as a side effect. Caller must hold `_lock`."""
-    now = time.time()
+    now = time.monotonic()
     expired = [ip for ip, until in _blacklist.items() if until <= now]
     for ip in expired:
         del _blacklist[ip]
@@ -252,16 +256,16 @@ def _patched_getaddrinfo(host, port, *args, **kwargs):
 def enable() -> bool:
     """Install the DNS override. Never blocks on the network — hardcoded IPs
     seed the pool immediately, background refresh replaces them within seconds.
-    Returns True as long as some IP is theoretically available (hardcoded not
-    fully exhausted OR cache non-empty)."""
-    global _patched
+    Returns True as long as some IP is theoretically available. Ref-counted:
+    concurrent callers each get their own enable/disable pair without racing
+    each other into a premature unpatch."""
+    global _patched, _patch_refcount
     with _lock:
-        if _patched:
-            return _has_available_ip_locked()
-        socket.getaddrinfo = _patched_getaddrinfo
-        _patched = True
+        _patch_refcount += 1
+        if not _patched:
+            socket.getaddrinfo = _patched_getaddrinfo
+            _patched = True
         available = _has_available_ip_locked()
-    # nudge a background refresh so the disk cache catches up
     prewarm()
     return available
 
@@ -269,7 +273,7 @@ def enable() -> bool:
 def _has_available_ip_locked() -> bool:
     """Whether pick() could produce something without a synchronous network
     call. Caller must already hold `_lock`."""
-    now = time.time()
+    now = time.monotonic()
     entry = _load_cache().get("vthreads.top")
     if entry and any(not _is_blacklisted(ip, now) for ip in (entry.get("ips") or [])):
         return True
@@ -277,9 +281,15 @@ def _has_available_ip_locked() -> bool:
 
 
 def disable() -> None:
-    global _patched
+    """Release one reference to the DNS patch. When the refcount reaches zero
+    (all callers have paired their enable/disable), restore the real
+    getaddrinfo. Never unpatches while another thread is still inside its
+    proxy attempt."""
+    global _patched, _patch_refcount
     with _lock:
-        if _patched:
+        if _patch_refcount > 0:
+            _patch_refcount -= 1
+        if _patch_refcount == 0 and _patched:
             socket.getaddrinfo = _orig_getaddrinfo
             _patched = False
 
