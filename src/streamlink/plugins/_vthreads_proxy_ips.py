@@ -31,6 +31,19 @@ _MIN_ALIVE = 2                 # fewer survivors → pool unusable
 _FAST_QUORUM = 2               # return as soon as this many pass screening
 _TARGET_POOL = 10              # background thread grows the pool to this size
 
+# Optimistic bootstrap: seed the pool with known-good CF-edge IPs so `pick()`
+# returns instantly on first use. If any are stale they get blacklisted and the
+# background refresh replaces them. Community-vetted at snapshot time — refreshed
+# every 30 min from _LIST_URL.
+_HARDCODED_IPS = [
+    "8.212.65.162",
+    "47.242.218.87",
+    "8.219.245.214",
+    "8.219.236.218",
+    "8.212.14.90",
+    "8.219.255.49",
+]
+
 # Background prewarm: kicks off on first import so first real use has no wait
 _prewarm_started = False
 _prewarm_thread: threading.Thread | None = None
@@ -185,7 +198,21 @@ def blacklist(ip: str) -> None:
 
 
 def pick() -> str | None:
-    ips = [ip for ip in refresh() if ip not in _blacklist]
+    """Return a proxy IP with zero blocking on the happy path.
+    Preference order:
+      1. Disk cache (populated by prewarm/refresh) — hot fast path
+      2. Hardcoded bootstrap IPs — used until cache is warm
+      3. Live refresh — only if the above two produced nothing"""
+    ips: list[str] = []
+    with _lock:
+        entry = _load_cache().get("vthreads.top")
+        if entry:
+            ips = [ip for ip in (entry.get("ips") or []) if ip not in _blacklist]
+    if not ips:
+        ips = [ip for ip in _HARDCODED_IPS if ip not in _blacklist]
+    if not ips:
+        # Everything blacklisted — synchronous refresh is the last resort.
+        ips = [ip for ip in refresh(force=True) if ip not in _blacklist]
     return random.choice(ips) if ips else None
 
 
@@ -199,20 +226,18 @@ def _patched_getaddrinfo(host, port, *args, **kwargs):
 
 
 def enable() -> bool:
-    """Install the DNS override. Returns True if a working IP pool is available."""
+    """Install the DNS override. Never blocks on the network — hardcoded IPs
+    seed the pool immediately, background refresh replaces them within seconds.
+    Returns True unless every hardcoded IP has been blacklisted this session."""
     global _patched
     with _lock:
         if _patched:
-            return bool(refresh())
-    # prime + screen outside the lock
-    ips = refresh()
-    if not ips:
-        return False
-    with _lock:
-        if not _patched:
-            socket.getaddrinfo = _patched_getaddrinfo
-            _patched = True
-    return True
+            return True
+        socket.getaddrinfo = _patched_getaddrinfo
+        _patched = True
+    # nudge a background refresh so the disk cache catches up
+    prewarm()
+    return pick() is not None
 
 
 def disable() -> None:

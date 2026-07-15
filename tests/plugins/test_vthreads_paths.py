@@ -32,11 +32,13 @@ TEST_URL = "https://www.youtube.com/watch?v=test123XXXX"
 @pytest.fixture(autouse=True)
 def _isolate_cache(monkeypatch, tmp_path):
     """Point cache files into a fresh dir per-test so entries don't leak between tests.
-    Also stub `time.sleep` so retry loops don't add real wall-clock delay."""
+    Also stub `time.sleep` and disable the proxy-IP pool so retry loops don't add
+    real wall-clock delay or touch the network."""
     cache_dir = tmp_path / "vthreads-cache"
     monkeypatch.setattr(V, "_CACHE_DIR", str(cache_dir))
     monkeypatch.setattr(V, "_URL_CACHE_FILE", str(cache_dir / "urls.json"))
     monkeypatch.setattr(V, "_EXTRACT_CACHE_FILE", str(cache_dir / "extract.json"))
+    monkeypatch.setenv("VTHREADS_USE_PROXY_IPS", "0")
     monkeypatch.delenv("VTHREADS_SKIP_CLOUD", raising=False)
     monkeypatch.delenv("VTHREADS_PREFETCH", raising=False)
     monkeypatch.setattr(V.time, "sleep", lambda s: None)
