@@ -60,12 +60,17 @@ def _canon_cloud_quality(q: str) -> str:
     return f"{m.group(1)}p" if m else "best"
 
 
+import random as _random
+
+
 def _random_fake_ip() -> str:
     """Random public-looking IPv4. First octet 100-219 skips the obvious
     reserved / private ranges (0/8, 10/8, 127/8, 169.254/16, 172.16/12,
     192.168/16, 224/4, 240/4). Good enough for HTTP header rotation."""
-    import random as _r
-    return f"{_r.randint(100, 219)}.{_r.randint(0, 255)}.{_r.randint(0, 255)}.{_r.randint(1, 253)}"
+    return (
+        f"{_random.randint(100, 219)}.{_random.randint(0, 255)}."
+        f"{_random.randint(0, 255)}.{_random.randint(1, 253)}"
+    )
 
 
 def _guess_selected_stream_hint() -> str | None:
@@ -459,9 +464,12 @@ class VThreads(Plugin):
         # retry with short exponential backoff — the client IP the server
         # trusts changes each iteration, so most rate limits clear within a
         # couple of tries. Transient network errors get one retry regardless.
-        # Anything else (real 4xx/5xx after retries exhausted) bubbles up so
-        # the outer fallback (proxy pool → cloud) can take over quickly.
-        max_rate_limit_retries = len(self._RATE_LIMIT_BACKOFF) + 1
+        # In the proxy-pool path we disable both retries so a bad IP surfaces
+        # immediately and blacklists — the outer loop rotates to another IP
+        # instead of wasting seconds retrying the same dead route.
+        max_rate_limit_retries = (
+            len(self._RATE_LIMIT_BACKOFF) + 1 if self._api_retry_transient else 0
+        )
         rate_limit_attempts = 0
         transient_attempts = 0
         while True:
