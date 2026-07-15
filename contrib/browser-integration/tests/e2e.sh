@@ -47,8 +47,12 @@ echo "==> 3/4 python native_host_protocol.py"
 "$PY" "$HERE/native_host_protocol.py"
 
 echo
-echo "==> 4/4 python cloud_live.py"
+echo "==> 4/5 python cloud_live.py"
 "$PY" "$HERE/cloud_live.py"
+
+echo
+echo "==> 5/5 python proxy_pool_live.py"
+"$PY" "$HERE/proxy_pool_live.py"
 
 echo
 echo "==> all checks passed"
