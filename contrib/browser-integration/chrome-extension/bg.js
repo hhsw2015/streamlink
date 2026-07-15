@@ -287,6 +287,8 @@ function sleep(ms) {
 // 1x1 dark-gray PNG (chrome.notifications rejects SVG data-URLs — needs a real bitmap).
 const NOTIFY_ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
+const NOTIFY_AUTO_CLEAR_MS = 4000;
+
 function notify(message, subtitle) {
   // Default subtitle tracks the current mode so a Local-only session never
   // sees a "☁ Cloud" title.
@@ -294,10 +296,21 @@ function notify(message, subtitle) {
     subtitle = currentMode === "local" ? "Local" : "Cloud";
   }
   const glyph = subtitle === "Local" ? "💻" : "☁";
-  chrome.notifications.create({
-    type: "basic",
-    iconUrl: NOTIFY_ICON,
-    title: "Streamlink " + glyph + " " + subtitle,
-    message,
-  });
+  chrome.notifications.create(
+    {
+      type: "basic",
+      iconUrl: NOTIFY_ICON,
+      title: "Streamlink " + glyph + " " + subtitle,
+      message,
+      // macOS honors this via Banner style; if the user has forced Alert style
+      // in System Settings we can't override — the setTimeout below is a
+      // belt-and-braces fallback that dismisses the notification ourselves.
+      requireInteraction: false,
+      silent: true,
+    },
+    (id) => {
+      if (!id) return;
+      setTimeout(() => chrome.notifications.clear(id), NOTIFY_AUTO_CLEAR_MS);
+    },
+  );
 }
