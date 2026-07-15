@@ -40,6 +40,7 @@ from urllib.parse import urljoin
 from streamlink.exceptions import PluginError, StreamError
 from streamlink.logger import getLogger
 from streamlink.plugin import HIGH_PRIORITY, Plugin, pluginmatcher
+from streamlink.plugins import _vthreads_proxy_ips as proxy_ips
 from streamlink.stream.http import HTTPStream
 from streamlink.stream.stream import Stream
 
@@ -447,6 +448,37 @@ class VThreads(Plugin):
                 time.sleep(3)
         raise PluginError("vthreads: request failed after 5 attempts: " + (type(last_err).__name__ if last_err else "unknown"))
 
+    def _try_with_proxy_ips(self, max_attempts: int = 3) -> dict | None:
+        """Route the extract call through a rotating proxy-IP DNS override.
+        Returns extract data on success, None on total failure — caller falls
+        back to direct + cloud. Never raises."""
+        if not proxy_ips.enable():
+            log.info("vthreads: proxy IP pool unavailable, skipping")
+            return None
+        last_err: Exception | None = None
+        for attempt in range(max_attempts):
+            ip = proxy_ips.pick()
+            if not ip:
+                break
+            log.info("vthreads: attempt " + str(attempt + 1) + " via proxy IP " + ip)
+            try:
+                data = self._extract()
+                return data
+            except Exception as err:
+                last_err = err
+                log.info("vthreads: proxy IP " + ip + " failed (" + type(err).__name__ + "), blacklisting")
+                proxy_ips.blacklist(ip)
+                # bust extract cache so the retry actually hits the network
+                try:
+                    os.remove(_EXTRACT_CACHE_FILE)
+                except OSError:
+                    pass
+        if last_err:
+            log.info("vthreads: all proxy attempts failed, falling through")
+        # Restore normal DNS so the direct-fallback + cloud paths use real vthreads DNS
+        proxy_ips.disable()
+        return None
+
     def _extract(self) -> dict:
         cached = _cache_get(_EXTRACT_CACHE_FILE, self.url, _EXTRACT_CACHE_TTL)
         if cached:
@@ -468,25 +500,32 @@ class VThreads(Plugin):
         return data
 
     def _get_streams(self):
-        # Local vthreads.top first (native CLI semantics — direct, no third-party hop).
-        # On failure fall back to the Cloud Worker extractor, which fronts vthreads via
-        # Cloudflare (rotating IPs help when upstream is rate-limiting our IP).
-        # Set VTHREADS_SKIP_CLOUD=1 to also disable the cloud fallback (used by the
-        # browser extension when its own cloud attempt already failed).
+        # Order (fastest first, fall through to slower/less-reliable paths):
+        #   1. direct vthreads.top — normal path, 0 extra latency
+        #   2. proxy-IP pool — rotates CF-edge IPs to bypass per-source-IP limits
+        #      when direct returns 429/1015. First activation adds 1-3s.
+        #   3. cloud worker — our CF Worker, shared cache saves repeat probes.
+        # VTHREADS_USE_PROXY_IPS=0 skips step 2. VTHREADS_SKIP_CLOUD=1 skips step 3.
         wanted_quality = _guess_selected_stream_hint() or "best"
         skip_cloud = os.environ.get("VTHREADS_SKIP_CLOUD") in ("1", "true", "yes")
+        use_proxy = os.environ.get("VTHREADS_USE_PROXY_IPS", "1") in ("1", "true", "yes")
 
         try:
             data = self._extract()
-        except PluginError as local_err:
-            if skip_cloud or not CLOUD_TOKEN:
-                raise
-            log.info("vthreads: local failed (" + str(local_err) + "), trying cloud")
-            cloud_result = self._cloud_extract(wanted_quality)
-            if cloud_result and cloud_result.get("direct_url"):
-                self.title = cloud_result.get("title") or self.title
-                return self._streams_from_cloud(cloud_result)
-            raise
+        except PluginError as direct_err:
+            data = None
+            if use_proxy:
+                log.info("vthreads: direct failed (" + str(direct_err) + "), trying proxy IPs")
+                data = self._try_with_proxy_ips()
+            if data is None:
+                if skip_cloud or not CLOUD_TOKEN:
+                    raise direct_err
+                log.info("vthreads: proxy also failed, trying cloud")
+                cloud_result = self._cloud_extract(wanted_quality)
+                if cloud_result and cloud_result.get("direct_url"):
+                    self.title = cloud_result.get("title") or self.title
+                    return self._streams_from_cloud(cloud_result)
+                raise direct_err
         self.title = data.get("title")
 
         streams: dict[str, Stream] = {}
