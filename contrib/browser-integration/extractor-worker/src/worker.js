@@ -1461,7 +1461,7 @@ async function nudgeJob(jobId, env, ctx) {
       const media = pickQuality(medias, job.quality);
       if (!media) throw new Error("no matching quality");
 
-      const sub = await callUpstreamWithRetry(service, "submit", {rel_url: media.url}, env);
+      const sub = await callUpstreamWithRetry(service, "submit", {rel_url: media.url, source_url: job.source_url}, env);
 
       // vthreads direct-stream: file served inline on /api/download_merge (no task).
       if (sub._direct_stream) {
