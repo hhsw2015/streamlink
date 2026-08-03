@@ -2,7 +2,7 @@
 # End-to-end sanity for the streamlink-redirect browser integration.
 #
 # Runs, in order:
-#   1. Python unit tests for the vthreads plugin (pytest)
+#   1. Python unit tests for the savenow plugin (pytest)
 #   2. Extension canonCloudQuality parity vs Python (node)
 #   3. Native-messaging host protocol round-trip (python)
 #   4. Cloud extractor live smoke (python + urllib)
@@ -27,9 +27,9 @@ fi
 echo "==> using PY=$PY"
 
 echo
-echo "==> 1/4 pytest tests/plugins/test_vthreads*.py"
+echo "==> 1/4 pytest tests/plugins/test_savenow.py"
 if [[ -n "${PYTEST:-}" ]]; then
-  (cd "$REPO" && "$PYTEST" tests/plugins/test_vthreads.py tests/plugins/test_vthreads_paths.py -x -q)
+  (cd "$REPO" && "$PYTEST" tests/plugins/test_savenow.py -x -q)
 else
   echo "  [SKIP] pytest not installed"
 fi
@@ -47,12 +47,8 @@ echo "==> 3/4 python native_host_protocol.py"
 "$PY" "$HERE/native_host_protocol.py"
 
 echo
-echo "==> 4/5 python cloud_live.py"
+echo "==> 4/4 python cloud_live.py"
 "$PY" "$HERE/cloud_live.py"
-
-echo
-echo "==> 5/5 python proxy_pool_live.py"
-"$PY" "$HERE/proxy_pool_live.py"
 
 echo
 echo "==> all checks passed"

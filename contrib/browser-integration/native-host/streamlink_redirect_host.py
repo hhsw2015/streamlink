@@ -68,6 +68,10 @@ def launch(url: str, quality: str, player: str, scheme: str, skip_cloud: bool) -
     child_log.flush()
     env = _child_env()
     if skip_cloud:
+        # Legacy name kept for any users who still pin an old plugin; the
+        # current savenow plugin doesn't read this and doesn't need to
+        # (there's no cloud step in-plugin, the extension already decided).
+        env["SAVENOW_SKIP_CLOUD"] = "1"
         env["VTHREADS_SKIP_CLOUD"] = "1"
     cmd = [
         STREAMLINK_REDIRECT,

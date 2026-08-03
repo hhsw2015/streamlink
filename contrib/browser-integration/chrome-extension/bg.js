@@ -2,7 +2,8 @@ const HOST = "com.streamlink.redirect";
 
 // Cloudflare Worker extractor. Preferred path — direct fetch, no native host needed.
 // On failure the click falls back to the native host (which runs streamlink-redirect
-// and forces the local vthreads-direct path via VTHREADS_SKIP_CLOUD=1).
+// and forces the local plugin path via skip_cloud=true (the savenow plugin
+// then hits the API directly with its own key pool).
 const CLOUD_BASE = "https://extractor.bugcf.ccwu.cc";
 const CLOUD_TOKEN = "test-token-2026-extractor";
 const CLOUD_POLL_INTERVAL_MS = 2000;
@@ -29,7 +30,8 @@ const DEFAULT_PLAYER_ID = "iina";
 const DEFAULT_QUALITY = "best";
 
 // Mode: "cloud" (default, browser calls cloud extractor first) or "local"
-// (skip cloud entirely, hand URL to native host which uses local vthreads).
+// (skip cloud entirely, hand URL to native host which uses the local savenow
+// plugin with its own key pool).
 // Persisted in chrome.storage.local, toggleable from the context menu.
 const MODE_KEY = "sl_mode";
 let currentMode = "cloud";

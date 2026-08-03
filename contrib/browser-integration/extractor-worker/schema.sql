@@ -43,7 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_expires ON extractor_jobs(expires_at);
 CREATE TABLE IF NOT EXISTS upstream_services (
   id                    TEXT PRIMARY KEY,
   base_url              TEXT NOT NULL,
-  api_type              TEXT NOT NULL,    -- vthreads | cobalt | metube
+  api_type              TEXT NOT NULL,    -- vthreads | savenow | cobalt | metube
   required_headers      TEXT DEFAULT '{}',
   supported_platforms   TEXT DEFAULT '["*"]',
   weight                INTEGER DEFAULT 10,
@@ -53,3 +53,17 @@ CREATE TABLE IF NOT EXISTS upstream_services (
   direct_url_ttl_s      INTEGER DEFAULT 3600,   -- best-guess TTL, override per service
   last_healthy_at       INTEGER DEFAULT 0
 );
+
+-- savenow.to (video-download-api.com) API-key pool. One row per registered
+-- account. Auto-populated by registerSavenowAccount() when the pool is dry.
+CREATE TABLE IF NOT EXISTS savenow_keys (
+  api_key         TEXT PRIMARY KEY,
+  email           TEXT,
+  password        TEXT,
+  balance_micro   INTEGER DEFAULT 0,     -- $USD × 1_000_000
+  retired         INTEGER DEFAULT 0,     -- 0 = usable, 1 = exhausted/burned
+  created_at      INTEGER,
+  last_used_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_savenow_keys_active
+  ON savenow_keys(retired, balance_micro);
