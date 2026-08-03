@@ -15,7 +15,7 @@ This directory is a **snapshot** copied from the primary repo at:
 https://github.com/hhsw2015/s3-balance  →  extractor-worker/
 ```
 
-Original commit at time of copy: `0d022cf92e3f094d97ec6c5869fb8b62a8348c95`
+Original commit at time of copy: `c4029e0b2065021dfc27bd3b00c0c267bcd5a8da`
 
 Bugfixes and new features happen there. This copy is here so anyone
 cloning this Streamlink fork can:

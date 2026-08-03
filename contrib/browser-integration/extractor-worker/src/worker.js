@@ -1278,6 +1278,9 @@ async function callSavenow(service, action, params, headers, env) {
       }
       throw new Error(`savenow submit not success: ${text.slice(0, 200)}`);
     }
+    // Debit the cached balance so ORDER BY balance_micro rotates keys
+    // predictably and we can proactively retire near-zero rows.
+    await debitSavenowKey(env, apikey, costMicroFor(fmt));
     // Adapt to vthreads shape — nudgeJob reads .task_id + writes it to job.ext_task_id.
     return {
       task_id: j.id,
@@ -1339,6 +1342,37 @@ async function retireSavenowKey(env, apikey) {
   } catch (e) { console.log("savenow retire fail:", e.message); }
 }
 
+// Cost table — mirrored from the savenow pricing doc. Values in balance-micro
+// (1_000_000 = $1). Anything unknown falls back to the standard 1080p rate.
+function costMicroFor(fmt) {
+  const std = 200;            // 0.00020 USD
+  const table = {
+    "mp3": 200, "m4a": 150, "webm": 200,
+    "144": 200, "240": 200, "360": 200, "480": 200,
+    "720": 200, "1080": 200,
+    "1440": 300,
+    "mp44k": 350, "mp48k": 350, "4k": 350, "8k": 350,
+  };
+  return table[fmt] || std;
+}
+
+async function debitSavenowKey(env, apikey, costMicro) {
+  try {
+    // Clamp to 0 with a CASE expression — SQLite's scalar MAX(a,b) needs
+    // 3.44+ and D1's SQLite version isn't guaranteed to be that new.
+    await env.DB.prepare(
+      "UPDATE savenow_keys "
+      + "SET balance_micro = CASE WHEN balance_micro - ? < 0 THEN 0 ELSE balance_micro - ? END, "
+      + "    last_used_at = ? "
+      + "WHERE api_key = ?",
+    ).bind(costMicro, costMicro, Date.now(), apikey).run();
+    // Auto-retire once we can't afford even a cheap standard request.
+    await env.DB.prepare(
+      "UPDATE savenow_keys SET retired = 1 WHERE api_key = ? AND balance_micro < 200",
+    ).bind(apikey).run();
+  } catch (e) { console.log("savenow debit fail:", e.message); }
+}
+
 async function registerSavenowAccount(env) {
   const origin = env.SAVENOW_REGISTER_ORIGIN || "https://video-download-api.com";
   const ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
@@ -1350,10 +1384,15 @@ async function registerSavenowAccount(env) {
   const cookies = collectCookies(r1);
   if (!csrf) return null;
 
-  const rand = (n) => Array.from({length: n}, () => "abcdefghijklmnopqrstuvwxyz"[Math.floor(Math.random() * 26)]).join("");
+  const rand = (n, chars = "abcdefghijklmnopqrstuvwxyz") =>
+    Array.from({length: n}, () => chars[Math.floor(Math.random() * chars.length)]).join("");
   const email = rand(10) + "@outlook.com";
   const name = rand(8).replace(/^./, c => c.toUpperCase());
-  const password = crypto.randomUUID();
+  // Mixed-case + digits + symbol to survive any typical password-strength check.
+  const password = rand(6, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    + rand(6, "abcdefghijklmnopqrstuvwxyz")
+    + rand(4, "0123456789")
+    + "!Xyz";
   const body = new URLSearchParams({
     _token: csrf, name, email, password, password_confirmation: password,
   }).toString();
@@ -1383,21 +1422,37 @@ async function registerSavenowAccount(env) {
   if (!apiKey) return null;
   const acc = {api_key: apiKey, email, password, balance_micro: balanceMicro, retired: 0, created_at: Date.now()};
   try {
+    // OR IGNORE (not REPLACE): if we somehow get a colliding api_key we
+    // don't want to zero out an active row's last_used_at.
     await env.DB.prepare(
-      "INSERT OR REPLACE INTO savenow_keys (api_key, email, password, balance_micro, retired, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+      "INSERT OR IGNORE INTO savenow_keys (api_key, email, password, balance_micro, retired, created_at) VALUES (?, ?, ?, ?, 0, ?)",
     ).bind(acc.api_key, acc.email, acc.password, acc.balance_micro, acc.created_at).run();
   } catch (e) { console.log("savenow register save fail:", e.message); }
   return acc;
 }
 
 function collectCookies(res) {
-  // fetch()'s Response.headers.getSetCookie() returns the individual
-  // Set-Cookie lines. Turn them into a "name=value; name=value" string
-  // suitable for the follow-up Cookie header.
+  // Cloudflare Workers doesn't implement Response.headers.getSetCookie()
+  // (nor .raw()), so we iterate raw headers. Multiple Set-Cookie values
+  // arrive as separate lines; the Headers iterator yields them one by one.
+  const cookies = [];
   try {
-    const raw = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
-    return raw.map(line => line.split(";")[0]).join("; ");
-  } catch (_) { return ""; }
+    for (const [name, value] of res.headers) {
+      if (name.toLowerCase() === "set-cookie") {
+        cookies.push(value.split(";")[0]);
+      }
+    }
+  } catch (_) { /* fall through */ }
+  // Fallback: some runtimes merge Set-Cookie into a single comma-joined
+  // header. Split heuristically on ", " that precedes a `name=value` pair.
+  if (cookies.length === 0) {
+    const merged = res.headers.get("set-cookie") || "";
+    if (merged) {
+      const parts = merged.split(/, (?=[^;=]+=)/);
+      for (const p of parts) cookies.push(p.split(";")[0]);
+    }
+  }
+  return cookies.join("; ");
 }
 
 class RateLimitError extends Error {

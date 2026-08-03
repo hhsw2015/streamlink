@@ -13,15 +13,8 @@ CREATE TABLE IF NOT EXISTS savenow_keys (
 CREATE INDEX IF NOT EXISTS idx_savenow_keys_active
   ON savenow_keys(retired, balance_micro);
 
--- Disable vthreads (dead / paywalled). Insert-or-replace ensures the row
--- exists but shows up as enabled=0 weight=0 in service lists.
-INSERT OR REPLACE INTO upstream_services
-  (id, base_url, api_type, required_headers, supported_platforms, weight, enabled, direct_url_ttl_s)
-VALUES
-  ('vthreads', 'https://vthreads.top', 'vthreads',
-   '{"Referer":"https://vthreads.top/","User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"}',
-   '["youtube","bilibili","douyin","tiktok","x","twitter","instagram","facebook","threads","reddit","pinterest","vimeo","snapchat","xiaohongshu","weibo","kuaishou"]',
-   0, 0, 3600);
+-- Retire vthreads entirely (service paywalled in mid-2026).
+DELETE FROM upstream_services WHERE id = 'vthreads';
 
 -- Add savenow as the primary upstream. YouTube-only per empirical tests.
 INSERT OR REPLACE INTO upstream_services
