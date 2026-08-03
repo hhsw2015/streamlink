@@ -110,6 +110,32 @@ CLOUD_TOKEN = os.environ.get("VTHREADS_CLOUD_TOKEN", "test-token-2026-extractor"
 CLOUD_POLL_INTERVAL = 2.0
 CLOUD_POLL_TIMEOUT = 300.0
 
+# savenow.to — commercial YouTube downloader API. Fourth-tier fallback used when
+# every free path (direct / proxy pool / vthreads cloud) has failed. Costs $0.0002
+# per 1080p request against wallet balance; leave SAVENOW_API_KEY unset to disable.
+SAVENOW_BASE = os.environ.get("SAVENOW_ENDPOINT", "https://p.savenow.to").rstrip("/")
+SAVENOW_API_KEY = os.environ.get("SAVENOW_API_KEY", "")
+SAVENOW_POLL_INTERVAL = 2.0
+SAVENOW_POLL_TIMEOUT = 180.0
+_SAVENOW_QUALITY_MAP = {
+    "2160p": "mp44k",
+    "2160p60": "mp44k",
+    "1440p": "1440",
+    "1440p60": "1440",
+    "1080p": "1080",
+    "1080p60": "1080",
+    "720p": "720",
+    "720p60": "720",
+    "480p": "480",
+    "360p": "360",
+    "240p": "240",
+    "144p": "144",
+    "best": "1080",
+    "worst": "144",
+    "audio_only": "mp3",
+    "smallest": "144",
+}
+
 POLL_INTERVAL = 2.0
 POLL_TIMEOUT = 600.0
 
@@ -436,6 +462,97 @@ class VThreads(Plugin):
         log.info("vthreads: cloud poll timed out")
         return None
 
+    def _savenow_extract(self, quality: str) -> dict | None:
+        """Paid savenow.to API — last-resort fallback. Returns a dict shaped
+        like _cloud_extract's result so the same _streams_from_cloud() code
+        can consume it. Only used when SAVENOW_API_KEY is set."""
+        if not SAVENOW_API_KEY:
+            return None
+        fmt = _SAVENOW_QUALITY_MAP.get(quality, "1080")
+        cache_key = self.url + "|q=" + quality + "|savenow=" + fmt
+        cached = _cache_get(_URL_CACHE_FILE, "savenow:" + cache_key, _URL_CACHE_TTL)
+        if cached and cached.get("direct_url"):
+            log.info("vthreads: savenow cache hit for " + quality)
+            return cached
+        submit_url = SAVENOW_BASE + "/api/v2/download"
+        params = {
+            "format": fmt,
+            "url": self.url,
+            "apikey": SAVENOW_API_KEY,
+            "add_info": "1",
+            "allow_extended_duration": "1",
+        }
+        log.info("vthreads: asking savenow.to for " + quality + " (format=" + fmt + ")")
+        try:
+            res = self.session.http.get(
+                submit_url,
+                params=params,
+                timeout=30,
+                retries=0,
+                raise_for_status=False,
+            )
+            if res.status_code >= 400:
+                log.info("vthreads: savenow submit HTTP " + str(res.status_code))
+                return None
+            payload = res.json()
+        except Exception as err:
+            log.info("vthreads: savenow submit error: " + type(err).__name__)
+            return None
+        if not isinstance(payload, dict) or not payload.get("success"):
+            return None
+        # Cache-hit / immediate case: response already has download URL.
+        if payload.get("url"):
+            return self._savenow_finalize(payload["url"], payload, cache_key)
+        progress_url = payload.get("progress_url")
+        job_id = payload.get("id")
+        if not progress_url and job_id:
+            progress_url = SAVENOW_BASE + "/api/progress?id=" + job_id
+        if not progress_url:
+            return None
+        deadline = time.monotonic() + SAVENOW_POLL_TIMEOUT
+        last_progress = -1
+        while time.monotonic() < deadline:
+            try:
+                r = self.session.http.get(progress_url, timeout=30, retries=0, raise_for_status=False)
+                if r.status_code >= 500:
+                    time.sleep(SAVENOW_POLL_INTERVAL)
+                    continue
+                if r.status_code >= 400:
+                    return None
+                info = r.json()
+            except Exception:
+                time.sleep(SAVENOW_POLL_INTERVAL)
+                continue
+            if not isinstance(info, dict):
+                return None
+            # savenow encodes 100% as progress=1000. Anything with a download_url
+            # is done regardless of the numeric progress.
+            progress = int(info.get("progress") or 0)
+            if progress != last_progress and progress % 200 == 0:
+                log.info("vthreads: savenow progress " + str(progress // 10) + "%")
+                last_progress = progress
+            dl = info.get("download_url")
+            if dl:
+                return self._savenow_finalize(dl, info, cache_key)
+            # savenow doesn't have a standard "failed" status field; empty text
+            # after a while + no download_url means job is stuck. Poll timeout
+            # handles that via the outer while-loop.
+            time.sleep(SAVENOW_POLL_INTERVAL)
+        log.info("vthreads: savenow poll timed out")
+        return None
+
+    def _savenow_finalize(self, direct_url: str, payload: dict, cache_key: str) -> dict:
+        info = payload.get("info") or {}
+        result = {
+            "direct_url": direct_url,
+            "title": info.get("title") or payload.get("title"),
+            "quality": payload.get("full_format") or payload.get("format"),
+            "required_headers": {},  # savenow's direct_url works without extra headers
+        }
+        _cache_put(_URL_CACHE_FILE, "savenow:" + cache_key, result)
+        log.info("vthreads: savenow resolved " + direct_url)
+        return result
+
     def _streams_from_cloud(self, result: dict) -> dict:
         direct_url = result["direct_url"]
         # Default to a real Chrome UA + Referer so vthreads (behind Cloudflare bot-fight)
@@ -572,15 +689,25 @@ class VThreads(Plugin):
         return data
 
     def _get_streams(self):
-        # Order (fastest first, fall through to slower/less-reliable paths):
-        #   1. direct vthreads.top — normal path, 0 extra latency
-        #   2. proxy-IP pool — rotates CF-edge IPs to bypass per-source-IP limits
-        #      when direct returns 429/1015. First activation adds 1-3s.
-        #   3. cloud worker — our CF Worker, shared cache saves repeat probes.
-        # VTHREADS_USE_PROXY_IPS=0 skips step 2. VTHREADS_SKIP_CLOUD=1 skips step 3.
+        # Fallback chain (fastest / cheapest first):
+        #   1. direct vthreads.top      — free, may 429 / paywall
+        #   2. proxy-IP pool            — rotate source IP (VTHREADS_USE_PROXY_IPS=0 to skip)
+        #   3. cloud CF worker          — shared cache (VTHREADS_SKIP_CLOUD=1 to skip)
+        #   4. savenow.to (paid)        — always works, ~$0.0002 / request; only
+        #                                 used when SAVENOW_API_KEY is set.
         wanted_quality = _guess_selected_stream_hint() or "best"
         skip_cloud = os.environ.get("VTHREADS_SKIP_CLOUD") in ("1", "true", "yes")
         use_proxy = os.environ.get("VTHREADS_USE_PROXY_IPS", "1") in ("1", "true", "yes")
+        prefer_paid = os.environ.get("VTHREADS_PREFER_PAID") in ("1", "true", "yes")
+
+        # Opt-in short-circuit: skip every free path and go straight to savenow.
+        # Useful once vthreads goes fully paid or when reliability matters more
+        # than cost.
+        if prefer_paid and SAVENOW_API_KEY:
+            savenow_result = self._savenow_extract(wanted_quality)
+            if savenow_result and savenow_result.get("direct_url"):
+                self.title = savenow_result.get("title") or self.title
+                return self._streams_from_cloud(savenow_result)
 
         try:
             data = self._extract()
@@ -589,14 +716,19 @@ class VThreads(Plugin):
             if use_proxy:
                 log.info("vthreads: direct failed (" + str(direct_err) + "), trying proxy IPs")
                 data = self._try_with_proxy_ips()
-            if data is None:
-                if skip_cloud or not CLOUD_TOKEN:
-                    raise direct_err
+            if data is None and not skip_cloud and CLOUD_TOKEN:
                 log.info("vthreads: proxy also failed, trying cloud")
                 cloud_result = self._cloud_extract(wanted_quality)
                 if cloud_result and cloud_result.get("direct_url"):
                     self.title = cloud_result.get("title") or self.title
                     return self._streams_from_cloud(cloud_result)
+            if data is None and SAVENOW_API_KEY:
+                log.info("vthreads: cloud also failed, trying savenow.to (paid)")
+                savenow_result = self._savenow_extract(wanted_quality)
+                if savenow_result and savenow_result.get("direct_url"):
+                    self.title = savenow_result.get("title") or self.title
+                    return self._streams_from_cloud(savenow_result)
+            if data is None:
                 raise direct_err
         self.title = data.get("title")
 
