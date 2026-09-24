@@ -50,6 +50,7 @@ entry_points = {
     "console_scripts": [
         "streamlink=streamlink_cli.main:main",
         "streamlink-redirect=streamlink_cli.redirect:main",
+        "streamlink-ytplay=streamlink_cli.ytplay:main",
     ],
 }
 

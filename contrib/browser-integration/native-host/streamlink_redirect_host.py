@@ -22,6 +22,7 @@ import traceback
 LOG_PATH = "/tmp/streamlink-native-host.log"
 CHILD_LOG = "/tmp/streamlink-redirect.log"
 STREAMLINK_REDIRECT = "streamlink-redirect"  # must be on PATH when Chrome runs us
+STREAMLINK_YTPLAY = "streamlink-ytplay"
 DEFAULT_PLAYER = os.environ.get("STREAMLINK_PLAYER", "IINA")  # macOS app name for `open -a`
 
 
@@ -56,6 +57,61 @@ def _child_env() -> dict:
     parts = [p for p in existing.split(":") if p] + [p for p in extras if p not in existing.split(":")]
     env["PATH"] = ":".join(parts)
     return env
+
+
+def write_cookies_file(cookies: list) -> str | None:
+    """Persist extension-provided cookies as a Netscape cookies.txt for yt-dlp."""
+    if not cookies:
+        return None
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="ytplay-cookies-", suffix=".txt")
+    with os.fdopen(fd, "w") as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        for c in cookies:
+            domain = str(c.get("domain", ""))
+            include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+            f.write("\t".join([
+                domain,
+                include_sub,
+                str(c.get("path", "/")),
+                "TRUE" if c.get("secure") else "FALSE",
+                str(int(c.get("expirationDate", 0) or 0)),
+                str(c.get("name", "")),
+                str(c.get("value", "")),
+            ]) + "\n")
+    os.chmod(path, 0o600)
+    return path
+
+
+def launch_ytplay(url: str, quality: str, scheme: str, cookies: list) -> int:
+    child_log = open(CHILD_LOG, "a")
+    child_log.write(
+        "\n===== " + _dt.datetime.now().isoformat(timespec="seconds")
+        + " [ytplay] url=" + url + " quality=" + quality
+        + " cookies=" + str(len(cookies)) + " =====\n",
+    )
+    child_log.flush()
+    cmd = [STREAMLINK_YTPLAY, url, quality, "--idle-timeout", "300"]
+    if scheme:
+        cmd += ["--player", scheme]
+    cookies_file = write_cookies_file(cookies)
+    if cookies_file:
+        cmd += ["--cookies", cookies_file]
+    else:
+        # No cookies from the extension (older worker / cookie API failure):
+        # let yt-dlp read the browser profile directly. Chrome first (keychain
+        # prompt possible on first use), YTPLAY_COOKIES_BROWSER to override.
+        cmd += ["--cookies-from-browser",
+                os.environ.get("YTPLAY_COOKIES_BROWSER", "chrome")]
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=child_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=_child_env(),
+    )
+    return proc.pid
 
 
 def launch(url: str, quality: str, player: str, scheme: str, skip_cloud: bool) -> int:
@@ -115,6 +171,28 @@ def main() -> int:
         if not url:
             write_message({"ok": False, "error": "empty url"})
             return 1
+        # ytplay (yt-dlp pipeline: any site, max quality, full seek) is the only
+        # resolve path now — savenow stopped granting credit, so the legacy
+        # streamlink-redirect chain dead-ends. Old extension payloads (no
+        # `engine` field, scheme template like "senplayer://...url=$edurl")
+        # are migrated here so stale service workers keep working.
+        if not prefetched:
+            if scheme and "://" not in scheme:
+                player_arg = scheme          # new payload: bare name (senplayer/iina)
+            elif scheme:
+                low = scheme.lower()         # legacy payload: full scheme template
+                if "senplayer" in low:
+                    player_arg = "senplayer"
+                elif "iina" in low:
+                    player_arg = "iina"
+                else:
+                    player_arg = scheme      # raw template - ytplay substitutes $edurl etc.
+            else:
+                player_arg = "iina" if player.lower() == "iina" else "senplayer"
+            pid = launch_ytplay(url, quality, player_arg, msg.get("cookies") or [])
+            log("launched streamlink-ytplay pid=" + str(pid) + " player=" + player_arg)
+            write_message({"ok": True, "pid": pid, "log": CHILD_LOG})
+            return 0
         if prefetched:
             if scheme:
                 from urllib.parse import quote as _q

@@ -1,15 +1,5 @@
 const HOST = "com.streamlink.redirect";
 
-// Cloudflare Worker extractor. Preferred path — direct fetch, no native host needed.
-// On failure the click falls back to the native host (which runs streamlink-redirect
-// and forces the local plugin path via skip_cloud=true (the savenow plugin
-// then hits the API directly with its own key pool).
-const CLOUD_BASE = "https://extractor.bugcf.ccwu.cc";
-const CLOUD_TOKEN = "test-token-2026-extractor";
-const CLOUD_POLL_INTERVAL_MS = 2000;
-const CLOUD_POLL_MAX_TRIES = 45;         // 45 × 2s = 90s ceiling before we bail to local
-const CLOUD_SUBMIT_TIMEOUT_MS = 15000;   // submit POST hard-abort so cloud outages don't hang
-
 // URL scheme templates adapted from OpenList's player list. macOS-friendly players only.
 // $edurl = percent-encoded resolved video URL. $durl = raw. See src/streamlink_cli/redirect.py.
 const PLAYERS = [
@@ -29,161 +19,76 @@ const QUALITIES = ["best", "2160p", "1440p", "1080p", "720p", "480p", "360p"];
 const DEFAULT_PLAYER_ID = "iina";
 const DEFAULT_QUALITY = "best";
 
-// Mode: "cloud" (default, browser calls cloud extractor first) or "local"
-// (skip cloud entirely, hand URL to native host which uses the local savenow
-// plugin with its own key pool).
-// Persisted in chrome.storage.local, toggleable from the context menu.
-const MODE_KEY = "sl_mode";
-let currentMode = "cloud";
-
-async function loadMode({ rebuildIfChanged = true } = {}) {
-  let stored;
-  try {
-    stored = await chrome.storage.local.get(MODE_KEY);
-  } catch (e) {
-    console.warn("[streamlink-redirect] loadMode: storage.get failed:", e);
-    return; // keep previous in-memory value
-  }
-  const before = currentMode;
-  if (stored[MODE_KEY] === "cloud" || stored[MODE_KEY] === "local") {
-    currentMode = stored[MODE_KEY];
-  }
-  // Only rebuild menus when we know we're not inside a click handler —
-  // rebuilding menus during a click is a race that can drop the click.
-  if (rebuildIfChanged && before !== currentMode) {
-    try { await rebuildMenus(); } catch (_) {}
-  }
-}
-
-async function setMode(mode) {
-  currentMode = mode;
-  await chrome.storage.local.set({ [MODE_KEY]: mode });
-  await rebuildMenus();
-  notify("switched to " + mode + " mode", mode === "cloud" ? "Cloud" : "Local");
-}
-
 async function rebuildMenus() {
   await chrome.contextMenus.removeAll();
-  const modeLabel = currentMode === "cloud" ? "☁ cloud" : "💻 local";
+  // ytplay: the primary path. yt-dlp pipeline — any site, max quality, full seek.
+  // Top-level entries are one-click "best"; each player also gets a quality submenu.
+  const YTPLAY_QUALITIES = ["best", "2160p", "1440p", "1080p", "720p", "480p", "360p"];
   chrome.contextMenus.create({
-    id: "sl-quick",
-    title: `Open in Streamlink (${modeLabel}, IINA, best)`,
+    id: "sl-yt-senplayer-q-best",
+    title: "▶ Play in SenPlayer (best)",
     contexts: ["link", "page", "video", "selection"],
   });
   chrome.contextMenus.create({
-    id: "sl-root",
-    title: `Open in Streamlink... (${modeLabel})`,
+    id: "sl-yt-iina-q-best",
+    title: "▶ Play in IINA (best)",
     contexts: ["link", "page", "video", "selection"],
   });
-  for (const p of PLAYERS) {
+  for (const pid of ["senplayer", "iina"]) {
+    const parent = `sl-yt-${pid}-more`;
     chrome.contextMenus.create({
-      id: `sl-p-${p.id}`,
-      parentId: "sl-root",
-      title: p.name,
+      id: parent,
+      title: (pid === "senplayer" ? "SenPlayer" : "IINA") + " quality...",
       contexts: ["link", "page", "video", "selection"],
     });
-    for (const q of QUALITIES) {
+    for (const q of YTPLAY_QUALITIES) {
       chrome.contextMenus.create({
-        id: `sl-p-${p.id}-q-${q}`,
-        parentId: `sl-p-${p.id}`,
+        id: `sl-yt-${pid}-sub-${q}`,
+        parentId: parent,
         title: q,
         contexts: ["link", "page", "video", "selection"],
       });
     }
   }
-  // Mode switch submenu — clearly labelled so you know which entry is active.
-  chrome.contextMenus.create({
-    id: "sl-sep",
-    parentId: "sl-root",
-    type: "separator",
-    contexts: ["link", "page", "video", "selection"],
-  });
-  chrome.contextMenus.create({
-    id: "sl-mode-cloud",
-    parentId: "sl-root",
-    type: "radio",
-    checked: currentMode === "cloud",
-    title: "Mode: ☁ Cloud first (fallback: local)",
-    contexts: ["link", "page", "video", "selection"],
-  });
-  chrome.contextMenus.create({
-    id: "sl-mode-local",
-    parentId: "sl-root",
-    type: "radio",
-    checked: currentMode === "local",
-    title: "Mode: 💻 Local only (skip cloud)",
-    contexts: ["link", "page", "video", "selection"],
-  });
+  // Legacy tree (streamlink-redirect + cloud extractor + savenow) removed:
+  // savenow stopped granting free credit, so that chain dead-ends at
+  // "Balance insufficient". ytplay (yt-dlp pipeline) is the only path now.
+  // Other players remain reachable via ytplay's PLAYER_SCHEMES if re-added.
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
-  await loadMode();
   await rebuildMenus();
 });
 
 chrome.runtime.onStartup.addListener(async () => {
-  await loadMode();
   await rebuildMenus();
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  // MV3 service workers get killed after ~30s of idle. When they respawn to
-  // handle a click, module-level `currentMode` is re-initialised to its
-  // default ("cloud") instead of the user's persisted choice. Reload from
-  // storage on every click so the mode setting is actually respected.
-  // Suppress the auto-rebuild — we're inside a click handler, mutating
-  // context menus mid-click would drop the current invocation.
-  await loadMode({ rebuildIfChanged: false });
-
-  // Mode switch clicks — no URL involved.
-  if (info.menuItemId === "sl-mode-cloud") return setMode("cloud");
-  if (info.menuItemId === "sl-mode-local") return setMode("local");
-
   const url = info.linkUrl || info.srcUrl || info.pageUrl || (tab && tab.url);
   if (!url) return notify("no URL to open");
 
-  let playerId, quality;
-  if (info.menuItemId === "sl-quick") {
-    playerId = DEFAULT_PLAYER_ID;
-    quality = DEFAULT_QUALITY;
-  } else if (info.menuItemId.startsWith("sl-p-") && info.menuItemId.includes("-q-")) {
-    const m = info.menuItemId.match(/^sl-p-(.+)-q-(.+)$/);
-    playerId = m[1];
-    quality = m[2];
-  } else {
-    return;
-  }
-
-  const player = PLAYERS.find((p) => p.id === playerId);
-  if (!player) return notify("unknown player: " + playerId);
-
-  console.log("[streamlink-redirect] clicked", { url, quality, player: player.name, mode: currentMode });
-
-  // Local-only mode: hand straight to the native host, cloud never touched.
-  if (currentMode === "local") {
-    notify(player.name + " " + quality + " → resolving (local)", "Local");
-    const payload = { url, quality, skip_cloud: true };
-    if (player.scheme) payload.scheme = player.scheme;
-    else if (player.app) payload.player = player.app;
+  // ytplay engine: yt-dlp pipeline via native host, site cookies attached.
+  // IDs: sl-yt-<player>-q-best (top level) and sl-yt-<player>-sub-<quality>.
+  const ytMatch = String(info.menuItemId).match(/^sl-yt-(senplayer|iina)-(?:q|sub)-(.+)$/);
+  if (ytMatch) {
+    const playerId = ytMatch[1];
+    const quality = ytMatch[2];
+    const player = PLAYERS.find((p) => p.id === playerId);
+    notify(player.name + " " + quality + " → resolving (ytplay)", "Local");
+    const cookies = await collectCookies(url);
+    const payload = {
+      engine: "ytplay",
+      url,
+      quality,
+      scheme: playerId,   // ytplay knows senplayer/iina by name
+      cookies,
+    };
     return sendToHost(payload, player, quality, "Local");
   }
 
-  // Cloud-first mode: try cloud, fall back to local on any failure/timeout.
-  notify(player.name + " " + quality + " → resolving (cloud)");
-  const cloudResult = await tryCloudExtract(url, quality);
-  if (cloudResult && cloudResult.direct_url) {
-    notify(player.name + " " + quality + " → launching (cloud)");
-    launchWithPlayer(player, cloudResult.direct_url);
-    return;
-  }
-
-  // Cloud failed → local fallback (native host, skip_cloud so we don't loop).
-  const payload = { url, quality, skip_cloud: true };
-  if (player.scheme) payload.scheme = player.scheme;
-  else if (player.app) payload.player = player.app;
-  console.log("[streamlink-redirect] cloud failed, using native host", payload);
-  notify("cloud unavailable, falling back to local", "Local");
-  return sendToHost(payload, player, quality, "Local");
+  // Anything else: legacy menu ids from an older service worker instance.
+  console.warn("[streamlink-redirect] unknown menu id:", info.menuItemId);
 });
 
 function sendToHost(payload, player, quality, subtitle) {
@@ -202,108 +107,35 @@ function sendToHost(payload, player, quality, subtitle) {
   });
 }
 
-async function tryCloudExtract(sourceUrl, quality) {
-  const cloudQuality = canonCloudQuality(quality);
-  const tag = `[cloud ${cloudQuality}]`;
-  console.log(tag, "POST", `${CLOUD_BASE}/extract`, {source_url: sourceUrl, quality: cloudQuality});
-  try {
-    const submitCtrl = new AbortController();
-    const submitTimer = setTimeout(() => submitCtrl.abort(), CLOUD_SUBMIT_TIMEOUT_MS);
-    let submitRes;
-    try {
-      submitRes = await fetch(`${CLOUD_BASE}/extract`, {
-        method: "POST",
-        headers: { "X-Auth": CLOUD_TOKEN, "Content-Type": "application/json" },
-        body: JSON.stringify({ source_url: sourceUrl, quality: cloudQuality }),
-        signal: submitCtrl.signal,
-      });
-    } finally {
-      clearTimeout(submitTimer);
-    }
-    console.log(tag, "submit response status =", submitRes.status);
-    const submitText = await submitRes.text();
-    console.log(tag, "submit body =", submitText.slice(0, 500));
-    if (!submitRes.ok) {
-      console.warn(tag, "submit not ok");
-      return null;
-    }
-    let submit;
-    try { submit = JSON.parse(submitText); }
-    catch (e) { console.warn(tag, "submit body not JSON:", e); return null; }
-    if (submit.status === "success" && submit.direct_url) {
-      console.log(tag, "cache-hit inline, direct_url =", submit.direct_url);
-      return submit;
-    }
-    if (!submit.job_id) { console.warn(tag, "no job_id"); return null; }
-    console.log(tag, "job_id =", submit.job_id, "polling every", CLOUD_POLL_INTERVAL_MS, "ms");
-
-    for (let i = 0; i < CLOUD_POLL_MAX_TRIES; i++) {
-      await sleep(CLOUD_POLL_INTERVAL_MS);
-      const stRes = await fetch(`${CLOUD_BASE}/status/${submit.job_id}`, {
-        headers: { "X-Auth": CLOUD_TOKEN },
-      });
-      if (!stRes.ok) { console.warn(tag, `status HTTP ${stRes.status} @try ${i}`); continue; }
-      const st = await stRes.json();
-      console.log(tag, `try ${i} status=${st.status} progress=${st.progress || 0}`);
-      if (st.status === "success") {
-        const rRes = await fetch(`${CLOUD_BASE}/result/${submit.job_id}`, {
-          headers: { "X-Auth": CLOUD_TOKEN },
-        });
-        console.log(tag, "result response =", rRes.status);
-        if (!rRes.ok) return null;
-        const r = await rRes.json();
-        console.log(tag, "final direct_url =", r.direct_url);
-        return r;
-      }
-      if (st.status === "failed") {
-        console.warn(tag, "job failed:", st.error);
-        return null;
-      }
-    }
-    console.warn(tag, "poll timed out after", CLOUD_POLL_MAX_TRIES, "tries");
-    return null;
-  } catch (err) {
-    console.warn(tag, "fetch threw:", err.name, err.message, err.stack);
-    return null;
-  }
-}
-
-function launchWithPlayer(player, directUrl) {
-  // Both scheme-based and app-based launches go through the native host with
-  // `prefetched: true`. The host runs `open` on macOS, which correctly hands
-  // the URL to the player without navigating away from the current browser tab
-  // (chrome.tabs.update on an iina:// URL would blank the YouTube page).
-  const payload = { url: directUrl, quality: "best", skip_cloud: true, prefetched: true };
-  if (player.scheme) {
-    payload.scheme = player.scheme;
-  } else if (player.app) {
-    payload.player = player.app;
-  }
-  chrome.runtime.sendNativeMessage(HOST, payload, (response) => {
-    if (chrome.runtime.lastError) {
-      console.error("[streamlink-redirect] launch host error:", chrome.runtime.lastError.message);
-      notify("launch failed: " + chrome.runtime.lastError.message);
-      return;
-    }
-    if (!response || !response.ok) {
-      notify("launch failed: " + (response && response.error ? response.error : "unknown"));
-    }
-  });
-}
-
-function canonCloudQuality(q) {
-  const s = String(q || "best").toLowerCase().trim();
-  if (["best", "smallest", "audio_only"].includes(s)) return s;
-  if (s === "worst") return "smallest";
-  const aliases = { fhd: "1080p", qhd: "1440p", "2k": "1440p",
-                    uhd: "2160p", "4k": "2160p", hd: "720p", sd: "480p" };
-  if (aliases[s]) return aliases[s];
-  const m = s.match(/(\d{3,4})/);
-  return m ? `${m[1]}p` : "best";
-}
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// Collect cookies for the video page's site (login-walled sites: Vimeo,
+// members-only videos, age gates). Sent to the native host, which writes a
+// Netscape cookies.txt for yt-dlp. Only the target site's cookies — never
+// the whole jar.
+async function collectCookies(pageUrl) {
+  try {
+    const host = new URL(pageUrl).hostname;
+    // Base domain heuristic: keep last two labels (good enough for the
+    // yt-dlp site list; ccTLD registrable-domain edge cases just send fewer
+    // cookies, which only means the site behaves as if logged out).
+    const parts = host.split(".");
+    const base = parts.slice(-2).join(".");
+    const cookies = await chrome.cookies.getAll({ domain: base });
+    return cookies.map((c) => ({
+      domain: c.domain,
+      path: c.path,
+      secure: c.secure,
+      expirationDate: c.expirationDate,
+      name: c.name,
+      value: c.value,
+    }));
+  } catch (e) {
+    console.warn("[streamlink-redirect] cookie collect failed:", e);
+    return [];
+  }
 }
 
 // 1x1 dark-gray PNG (chrome.notifications rejects SVG data-URLs — needs a real bitmap).
@@ -314,9 +146,7 @@ const NOTIFY_AUTO_CLEAR_MS = 4000;
 function notify(message, subtitle) {
   // Default subtitle tracks the current mode so a Local-only session never
   // sees a "☁ Cloud" title.
-  if (!subtitle) {
-    subtitle = currentMode === "local" ? "Local" : "Cloud";
-  }
+  if (!subtitle) subtitle = "Local";
   const glyph = subtitle === "Local" ? "💻" : "☁";
   chrome.notifications.create(
     {
