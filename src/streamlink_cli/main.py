@@ -1,5 +1,7 @@
+# ruff: file-ignore[global-statement]
 from __future__ import annotations
 
+import argparse
 import importlib.metadata
 import logging
 import os
@@ -48,7 +50,6 @@ from streamlink_cli.utils.versioncheck import check_version
 
 
 if TYPE_CHECKING:
-    import argparse
     from collections.abc import Mapping
 
     from streamlink.plugin import Plugin
@@ -165,7 +166,7 @@ def create_output(formatter: Formatter) -> FileOutput | PlayerOutput:
             except OSError as err:
                 raise StreamlinkCLIError(f"Failed to create pipe: {err}") from err
         elif args.player_http:
-            http = create_http_server()
+            http = create_http_server(host="127.0.0.1", port=0)
 
         if args.record:
             if args.record == "-":
@@ -229,7 +230,7 @@ def output_stream_http(
                 + " You must specify the path to a player executable with --player.",
             )
 
-        server = create_http_server()
+        server = create_http_server(host="127.0.0.1", port=0)
         player = output = PlayerOutput(
             path=args.player,
             args=args.player_args,
@@ -246,7 +247,7 @@ def output_stream_http(
         except OSError as err:
             raise StreamlinkCLIError(f"Failed to start player: {args.player} ({err})") from err
     else:
-        server = create_http_server(args.player_external_http_interface, port)
+        server = create_http_server(host=args.player_external_http_interface, port=port)
         player = None
 
         log.info("Starting server, access with one of:")
@@ -266,7 +267,7 @@ def output_stream_http(
 
         stream_fd = prebuffer = None
         while not stream_fd and (not player or player.running):
-            try:  # noqa: PLW0717
+            try:  # ruff: ignore[too-many-statements-in-try-clause]
                 if not initial_streams_used:
                     streams = initial_streams
                     initial_streams_used = True
@@ -625,7 +626,7 @@ def handle_url():
 
     """
 
-    try:  # noqa: PLW0717
+    try:  # ruff: ignore[too-many-statements-in-try-clause]
         pluginname, pluginclass, resolved_url = streamlink.resolve_url(args.url)
         log.info(f"Found matching plugin {pluginname} for URL {args.url}")
 
@@ -747,7 +748,11 @@ def setup_args(
     prefix = parser.fromfile_prefix_chars or "@"
     configs = [f"{prefix}{config_file}" for config_file in config_files or []]
 
-    args, unknown = parser.parse_known_args(configs + arglist)
+    try:
+        args, unknown = parser.parse_known_args(configs + arglist)
+    except argparse.ArgumentError as err:
+        raise StreamlinkCLIError(f"{parser.prog}: error: {err}", code=2) from err
+
     if unknown and not ignore_unknown:
         # output the same text as parser.error(), but raise a StreamlinkCLIError
         usage = parser.format_usage()
@@ -1028,7 +1033,8 @@ def main():
         parser = build_parser()
         setup(parser)
     except StreamlinkCLIError as err:
-        sys.stderr.write(f"{err}\n")
+        if sys.stderr:
+            sys.stderr.write(f"{err}\n")
         raise SystemExit(err.code) from None
 
     try:

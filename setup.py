@@ -26,8 +26,8 @@ if CURRENT_PYTHON < REQUIRED_PYTHON:
     )
 
 
-from pathlib import Path  # noqa: E402
-from typing import TYPE_CHECKING  # noqa: E402
+from pathlib import Path  # ruff: ignore[module-import-not-at-top-of-file]
+from typing import TYPE_CHECKING  # ruff: ignore[module-import-not-at-top-of-file]
 
 
 if TYPE_CHECKING:
@@ -58,11 +58,12 @@ if is_wheel_for_windows(sys.argv):
 
 
 # optional data files
-data_files: "list[tuple[str, Sequence[str]]]" = [  # noqa: UP037
+data_files: "list[tuple[str, Sequence[str]]]" = [  # ruff: ignore[quoted-annotation]
     # shell completions:
     #  requires pre-built completion files via shtab ("build" dependency group)
-    #  `./script/build-shell-completions.sh`
+    #  `./script/build-shell-completions.py`
     ("share/bash-completion/completions", ["completions/bash/streamlink"]),
+    ("share/fish/vendor_completions.d", ["completions/fish/streamlink.fish"]),
     ("share/zsh/site-functions", ["completions/zsh/_streamlink"]),
     # man page:
     #  requires the pre-built man page file via sphinx ("docs" dependency group)
@@ -86,7 +87,7 @@ if __name__ == "__main__":
         from versioningit import get_cmdclasses
     except ImportError:  # pragma: no cover
 
-        def get_cmdclasses(bases: "dict[str, type[Command]] | None" = None) -> "dict[str, type[Command]]":  # noqa: UP037
+        def get_cmdclasses(bases: "dict[str, type[Command]] | None" = None) -> "dict[str, type[Command]]":  # ruff: ignore[quoted-annotation]
             return bases or {}
 
     setup(

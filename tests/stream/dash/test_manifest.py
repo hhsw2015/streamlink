@@ -201,6 +201,22 @@ class TestMPDParser:
                 "http://test.se/video/250kbit/segment_5.m4s",
             ]
 
+    def test_segments_timeline_gap(self):
+        with xml("dash/test_timeline_gap.mpd") as mpd_xml:
+            mpd = MPD(mpd_xml, base_url="http://test.se/", url="http://test.se/manifest.mpd")
+
+            segments = mpd.periods[0].adaptationSets[0].representations[0].segments()
+            init_segment = next(segments)
+            assert init_segment.uri == "http://test.se/init.m4s"
+
+            # The second `<S t="10000">` signals a gap: its explicit @t must be
+            # honoured instead of continuing the running time from 8000.
+            assert [segment.uri for segment in itertools.islice(segments, 3)] == [
+                "http://test.se/seg-1.m4s?t=0",
+                "http://test.se/seg-2.m4s?t=4000",
+                "http://test.se/seg-3.m4s?t=10000",
+            ]
+
     def test_segments_dynamic_time(self):
         with xml("dash/test_3.mpd") as mpd_xml:
             mpd = MPD(mpd_xml, base_url="http://test.se/", url="http://test.se/manifest.mpd")
@@ -877,3 +893,34 @@ class TestMPDParser:
         assert getattr(mpd.get_representation(("period-0", "0", "audio2")), "mimeType", None) == "audio/mp4"
         assert getattr(mpd.get_representation(("period-0", None, "video1")), "mimeType", None) == "video/mp4"
         assert getattr(mpd.get_representation(("period-0", None, "video2")), "mimeType", None) == "video/mp4"
+
+    def test_attribute_namespaces(self):
+        with xml("dash/test_attribute_namespaces.mpd") as mpd_xml:
+            mpd = MPD(mpd_xml, base_url="http://test/", url="http://test/manifest.mpd")
+
+        assert [
+            (
+                cont_prot.schemeIdUri,
+                cont_prot.default_KID,
+                cont_prot.value,
+            )
+            for period in mpd.periods
+            for aset in period.adaptationSets
+            for cont_prot in aset.contentProtections
+        ] == [
+            (
+                "urn:mpeg:dash:mp4protection:2011",
+                "00000000-0000-0000-0000-000000000000",
+                "cenc",
+            ),
+            (
+                "urn:mpeg:dash:mp4protection:2011",
+                "00000000-0000-0000-0000-000000000001",
+                "cenc",
+            ),
+            (
+                "urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95",
+                None,
+                "MSPR 2.0",
+            ),
+        ]

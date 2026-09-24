@@ -167,6 +167,8 @@ class MPDNode:
     def attr(
         self,
         key: str,
+        *,
+        namespace: str | None = None,
         inherited: TAttrInherited = None,
     ) -> str | None: ...  # pragma: no cover
 
@@ -174,6 +176,8 @@ class MPDNode:
     def attr(
         self,
         key: str,
+        *,
+        namespace: str | None = None,
         parser: type[TAttrParseResult] | Callable[[Any], TAttrParseResult],
         inherited: TAttrInherited = None,
     ) -> TAttrParseResult | None: ...  # pragma: no cover
@@ -182,6 +186,8 @@ class MPDNode:
     def attr(
         self,
         key: str,
+        *,
+        namespace: str | None = None,
         required: Literal[True],
         inherited: TAttrInherited = None,
     ) -> str: ...  # pragma: no cover
@@ -190,6 +196,8 @@ class MPDNode:
     def attr(
         self,
         key: str,
+        *,
+        namespace: str | None = None,
         parser: type[TAttrParseResult] | Callable[[Any], TAttrParseResult],
         required: Literal[True],
         inherited: TAttrInherited = None,
@@ -199,6 +207,8 @@ class MPDNode:
     def attr(
         self,
         key: str,
+        *,
+        namespace: str | None = None,
         required: bool = False,
         inherited: TAttrInherited = None,
     ) -> str | None: ...  # pragma: no cover
@@ -207,6 +217,8 @@ class MPDNode:
     def attr(
         self,
         key: str,
+        *,
+        namespace: str | None = None,
         default: TAttrDefault,
         inherited: TAttrInherited = None,
     ) -> str | TAttrDefault: ...  # pragma: no cover
@@ -215,20 +227,29 @@ class MPDNode:
     def attr(
         self,
         key: str,
+        *,
+        namespace: str | None = None,
         parser: type[TAttrParseResult] | Callable[[Any], TAttrParseResult],
         default: TAttrDefault,
         inherited: TAttrInherited = None,
     ) -> TAttrParseResult | TAttrDefault: ...  # pragma: no cover
 
-    def attr(self, key, parser=None, default=None, required=False, inherited=None):
+    def attr(self, key, *, namespace=None, parser=None, default=None, required=False, inherited=None):
         self.attributes.add(key)
-        if key in self.attrib:
-            value = self.attrib.get(key)
+
+        if namespace is None:
+            attrib = key
+        else:
+            attrib = f"{{{namespace}}}{key}"
+
+        if attrib in self.attrib:
+            value = self.attrib.get(attrib)
             if parser and callable(parser):
                 return parser(value)
             else:
                 return value
-        elif inherited:
+
+        if inherited:
             value = self.walk_back_get_attr(key, inherited)
             if value is not None:
                 return value
@@ -1020,7 +1041,9 @@ class SegmentTimeline(MPDNode):
     def segments(self) -> Iterator[TimelineSegment]:
         t = 0
         for tsegment in self.timeline_segments:
-            if t == 0 and tsegment.t is not None:
+            # An explicit @t overrides the running time on any segment, not just
+            # the first one, which is how a SegmentTimeline signals a gap.
+            if tsegment.t is not None:
                 t = tsegment.t
             # check the start time from MPD
             for _ in range(tsegment.r + 1):
@@ -1073,4 +1096,4 @@ class ContentProtection(MPDNode):
 
         self.schemeIdUri = self.attr("schemeIdUri")
         self.value = self.attr("value")
-        self.default_KID = self.attr("default_KID")
+        self.default_KID = self.attr("default_KID") or self.attr("default_KID", namespace="urn:mpeg:cenc:2013")  # 5.8.5.2.2

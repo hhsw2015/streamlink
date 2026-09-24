@@ -83,7 +83,7 @@ class TestLogging:
     ):
         params = getattr(request, "param", {})
 
-        with pytest.raises(Exception) as cm:  # noqa: PT011
+        with pytest.raises(Exception) as cm:  # ruff: ignore[pytest-raises-too-broad]
             logger.basicConfig(stream=output, **params)
 
         return cm.value
@@ -129,8 +129,8 @@ class TestLogging:
     )
     def test_level_names(self, name: str, level: int):
         assert logging.getLevelName(level) == name
-        assert logging.getLevelName(name) == level
-        assert logging.getLevelName(name.upper()) == level
+        assert logging.getLevelName(name) == level  # type: ignore[ty:deprecated]
+        assert logging.getLevelName(name.upper()) == level  # type: ignore[ty:deprecated]
 
     def test_levels_list(self):
         assert logger.levels == ["none", "critical", "error", "warning", "info", "debug", "trace", "all"]
@@ -339,7 +339,7 @@ class TestLogging:
 
         handler = log.handlers[0]
         assert isinstance(handler, logging.StreamHandler)
-        handler.setStream(output_ascii)  # type: ignore  # Expected: Never ???
+        handler.setStream(output_ascii)
 
         log.info("Bär: 🐻")
         assert getvalue(output) == "[test][info] Bär: 🐻\n"
@@ -382,10 +382,10 @@ class TestLogging:
 
     def test_logfile(self, logfile: Path, log: StreamlinkLogger, output: TextIOWrapper):
         log.setLevel("info")
-        log.info("Hello world, Γειά σου Κόσμε, こんにちは世界")  # noqa: RUF001
+        log.info("Hello world, Γειά σου Κόσμε, こんにちは世界")  # ruff: ignore[ambiguous-unicode-character-string]
         log.handlers[0].flush()
         with logfile.open("r", encoding="utf-8") as fh:
-            assert fh.read() == "[test][info] Hello world, Γειά σου Κόσμε, こんにちは世界\n"  # noqa: RUF001
+            assert fh.read() == "[test][info] Hello world, Γειά σου Κόσμε, こんにちは世界\n"  # ruff: ignore[ambiguous-unicode-character-string]
 
 
 class TestCaptureWarnings:
