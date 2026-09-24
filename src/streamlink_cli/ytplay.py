@@ -754,9 +754,10 @@ class VideoRemuxer:
     """
 
     HEAD_BYTES = 4 << 20      # enough to cover EBML+Info+Tracks+Cues+first cluster
-    WORKERS = 4
-    AHEAD = 6                 # segments to prefetch past the last requested one
-    CACHE = 64               # remuxed segments kept in memory (LRU)
+    WORKERS = 3               # gentle prefetch: must not starve the foreground fetch
+    AHEAD = 4                 # segments to prefetch past the last requested one
+    CACHE = 96               # remuxed segments kept in memory (LRU)
+    FETCH_CHUNK = 2 << 20    # foreground: split byte range across rotating-proxy exits
 
     def __init__(self, url: str, proxy: str | None, headers: dict | None, duration: float):
         from collections import OrderedDict
@@ -855,10 +856,41 @@ class VideoRemuxer:
         raise RuntimeError("could not determine webm size")
 
     # -- remux --------------------------------------------------------------- #
-    def _mini(self, i: int) -> bytes:
+    def _mini(self, i: int, parallel: bool = True) -> bytes:
         a = self.seg_data + int(self.cues[i][1])
         b = (self.seg_data + int(self.cues[i + 1][1]) - 1) if i + 1 < len(self.cues) else (self.total - 1)
-        return self.header + self.up.fetch_range(a, b)
+        body = self._fetch_parallel(a, b) if parallel else self.up.fetch_range(a, b)
+        return self.header + body
+
+    def _fetch_parallel(self, a: int, b: int) -> bytes:
+        # Foreground only: split one segment's byte range across parallel
+        # connections. The rotating proxy hands each connection its own exit, so
+        # chunks download over several exits at once - faster than one stream for
+        # the segment the player is waiting on. Prefetch stays single-connection
+        # so it never starves this foreground fetch.
+        total = b - a + 1
+        if total <= self.FETCH_CHUNK:
+            return self.up.fetch_range(a, b)
+        n = min(6, (total + self.FETCH_CHUNK - 1) // self.FETCH_CHUNK)
+        step = (total + n - 1) // n
+        ranges = [(a + k * step, min(b, a + (k + 1) * step - 1)) for k in range(n)]
+        ranges = [(s, e) for s, e in ranges if s <= e]
+        parts: list = [b""] * len(ranges)
+        errs: list = [None] * len(ranges)
+
+        def grab(k, s, e):
+            try:
+                parts[k] = self.up.fetch_range(s, e)
+            except Exception as exc:  # noqa: BLE001 - re-raised after join
+                errs[k] = exc
+
+        ths = [threading.Thread(target=grab, args=(k, s, e)) for k, (s, e) in enumerate(ranges)]
+        for t in ths: t.start()
+        for t in ths: t.join()
+        for exc in errs:
+            if exc:
+                raise exc
+        return b"".join(parts)
 
     def _remux(self, mini: bytes):
         import tempfile
@@ -913,8 +945,8 @@ class VideoRemuxer:
         return bytes(d)
 
     # -- public -------------------------------------------------------------- #
-    def _produce(self, i: int) -> bytes:
-        init, m4s = self._remux(self._mini(i))
+    def _produce(self, i: int, parallel: bool = True) -> bytes:
+        init, m4s = self._remux(self._mini(i, parallel=parallel))
         return self._patch(m4s, self.segments[i][0])
 
     def get_segment(self, i: int) -> bytes | None:
@@ -963,7 +995,7 @@ class VideoRemuxer:
 
     def _bg(self, j: int, ev: threading.Event):
         try:
-            data = self._produce(j)
+            data = self._produce(j, parallel=False)  # gentle: don't starve foreground
             with self.lock:
                 self.cache[j] = data; self.cache.move_to_end(j)
                 while len(self.cache) > self.CACHE:
