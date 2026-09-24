@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import re
 import http.client
 import json
 import os
@@ -101,18 +102,56 @@ def detect_proxy() -> str | None:
 # yt-dlp extraction
 # --------------------------------------------------------------------------- #
 
+_HW_TIER: str | None = None
+
+
+def _hw_decode_tier() -> str:
+    """Hardware video decode capability of this machine.
+
+    "av1": AV1 + VP9 hw decode (Apple M3+); "vp9": VP9 only (Apple M1/M2 -
+    AV1 must be soft-decoded, which drops frames above 1080p); "": unknown.
+    """
+    global _HW_TIER
+    if _HW_TIER is None:
+        tier = ""
+        if sys.platform == "darwin":
+            try:
+                brand = subprocess.run(
+                    ["sysctl", "-n", "machdep.cpu.brand_string"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+                m = re.search(r"\bApple M(\d+)", brand)
+                if m:
+                    tier = "av1" if int(m.group(1)) >= 3 else "vp9"
+            except (OSError, subprocess.SubprocessError, ValueError):
+                pass
+        _HW_TIER = tier
+    return _HW_TIER
+
+
 def format_selector(quality: str) -> str:
     try:
         height = int(str(quality).lower().rstrip("p"))
     except ValueError:
         height = 8640  # best/max/anything unparseable -> no ceiling
     h = f"[height<={height}]"
+    # On M1/M2 (VP9-only hw decode), >1080p AV1 soft-decodes into a slideshow.
+    # YouTube's only hw-decodable codec above 1080p is VP9, and its fMP4 form
+    # is served exclusively via HLS (the webm form has no sidx) -> prefer the
+    # vp09 HLS pair there; bv* picks HDR over SDR by itself when both exist.
+    # The [height>1080] guard keeps <=1080p videos on the proven av01 sidx path.
+    vp9_hls = (
+        f"bv*{h}[height>1080][vcodec^=vp09][protocol^=m3u8]+ba[protocol^=m3u8]/"
+        if height > 1080 and _hw_decode_tier() == "vp9" else ""
+    )
     # Preference order:
+    #   0.   (M1/M2 only, >1080p) vp09 HLS pair -> hlspair mode, hw decode
     #   1/2. fMP4 pairs (av01 first: better compression + hw decode) -> sidx mode
     #   3.   any https video + m4a audio pair (some sites serve vp9-in-mp4)
     #   4.   best single format at target height (progressive file or HLS)
     #   5.   absolute best anything
     return (
+        vp9_hls +
         f"bv*{h}[vcodec^=av01][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
         f"bv*{h}[vcodec^=avc1][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
         f"bv*{h}[ext=mp4][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
@@ -202,10 +241,15 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
             "proxy": used_proxy}
     if fmts:
         video = next((f for f in fmts if f.get("vcodec") not in (None, "none")), None)
-        audio = next((f for f in fmts if f.get("acodec") not in (None, "none")), None)
+        # audio-only = no video codec (acodec itself is often None on HLS
+        # renditions, where the codec isn't declared per-format)
+        audio = next((f for f in fmts if f.get("vcodec") in (None, "none") and f is not video), None)
         if not video or not audio:
             raise RuntimeError("unexpected format pair from yt-dlp")
-        info.update(mode="sidx", video=video, audio=audio)
+        # vp09 HLS pair (M1/M2 >1080p): both URLs are m3u8 playlists, not
+        # byte-range files - proxy them instead of sidx-parsing them.
+        mode = "hlspair" if "m3u8" in (video.get("protocol") or "") else "sidx"
+        info.update(mode=mode, video=video, audio=audio)
         return info
 
     proto = data.get("protocol") or ""
@@ -554,8 +598,10 @@ def rewrite_m3u8(text: str, base_url: str) -> str:
                 stripped = head + 'URI="' + local(uri, is_playlist) + '"' + tail
             out.append(stripped)
         else:
-            # bare URI line: variant (master) or segment (media)
-            is_playlist = ".m3u8" in stripped.split("?", 1)[0]
+            # bare URI line: variant (master) or segment (media). Match on the
+            # path SUFFIX: googlevideo segment paths embed ".../index.m3u8/..."
+            # mid-path (e.g. .../playlist/index.m3u8/govp/.../file/seg.ts).
+            is_playlist = stripped.split("?", 1)[0].endswith(".m3u8")
             out.append(local(stripped, is_playlist))
     return "\n".join(out) + "\n"
 
@@ -735,6 +781,12 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
                 val = res.headers.get(key)
                 if val:
                     self.send_header(key, val)
+            if not res.headers.get("Content-Length"):
+                # upstream is chunked (googlevideo HLS segments): without a
+                # length the client can't find the body end on a keep-alive
+                # connection and hangs until timeout - close to delimit.
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             if self.command == "HEAD":
                 return
@@ -970,6 +1022,29 @@ def main() -> int:
             }
             entry = "/master.m3u8"
             quality_note = f"{video.get('height')}p {video.get('vcodec') or ''}"
+
+    elif info["mode"] == "hlspair":
+        # vp09 HLS video + m3u8 audio (M1/M2 >1080p hw-decode path): serve a
+        # local master that pairs the two proxied media playlists.
+        video, audio = info["video"], info["audio"]
+        log(f"mode=hlspair {video.get('format_id')} {video.get('width')}x{video.get('height')} "
+            f"{video.get('vcodec')} + {audio.get('format_id')}")
+        hls_fetcher = HlsFetcher(proxy, video.get("http_headers"))
+        vcodec = video.get("vcodec") or "vp09"
+        bandwidth = int(((video.get("tbr") or 8000) + (audio.get("tbr") or 128)) * 1000)
+        playlists = {
+            "/master.m3u8": "\n".join([
+                "#EXTM3U",
+                '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="audio",DEFAULT=YES,'
+                'AUTOSELECT=YES,URI="/hls.m3u8?u=' + _b64(audio["url"]) + '"',
+                f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},'
+                f'CODECS="{vcodec},mp4a.40.2",'
+                f'RESOLUTION={video.get("width")}x{video.get("height")},AUDIO="a"',
+                "/hls.m3u8?u=" + _b64(video["url"]),
+            ]) + "\n",
+        }
+        entry = "/master.m3u8"
+        quality_note = f"{video.get('height')}p {vcodec.split('.')[0]} HLS"
 
     elif info["mode"] == "hls":
         media = info["media"]
