@@ -129,29 +129,41 @@ def _hw_decode_tier() -> str:
     return _HW_TIER
 
 
-def format_selector(quality: str) -> str:
+def _height_ceiling(quality: str) -> int:
     try:
-        height = int(str(quality).lower().rstrip("p"))
+        return int(str(quality).lower().rstrip("p"))
     except ValueError:
-        height = 8640  # best/max/anything unparseable -> no ceiling
+        return 8640  # best/max/anything unparseable -> no ceiling
+
+
+def _remux_tier(quality: str) -> bool:
+    """True when we must repackage vp9 to serve >1080p smoothly.
+
+    M1/M2 have no AV1 hw decoder, so >1080p AV1 soft-decodes into a slideshow.
+    The only hw-decodable >1080p codec YouTube gives an authenticated (cookie'd)
+    client is VP9-in-webm, which HLS can't carry - so we remux it to fMP4 HLS.
+    """
+    return _height_ceiling(quality) > 1080 and _hw_decode_tier() == "vp9"
+
+
+def format_selector(quality: str) -> str:
+    height = _height_ceiling(quality)
     h = f"[height<={height}]"
-    # On M1/M2 (VP9-only hw decode), >1080p AV1 soft-decodes into a slideshow.
-    # YouTube's only hw-decodable codec above 1080p is VP9, and its fMP4 form
-    # is served exclusively via HLS (the webm form has no sidx) -> prefer the
-    # vp09 HLS pair there; bv* picks HDR over SDR by itself when both exist.
-    # The [height>1080] guard keeps <=1080p videos on the proven av01 sidx path.
-    vp9_hls = (
-        f"bv*{h}[height>1080][vcodec^=vp09][protocol^=m3u8]+ba[protocol^=m3u8]/"
-        if height > 1080 and _hw_decode_tier() == "vp9" else ""
+    # M1/M2 >1080p: take vp9 webm + AAC m4a for remux mode (extract_streams
+    # routes this pair to on-the-fly fMP4-HLS repackaging). Kept above the av01
+    # branch so it wins; <=1080p and M3+ fall straight through to av01 sidx.
+    vp9_remux = (
+        f"bv*{h}[vcodec^=vp9][ext=webm]+ba[ext=m4a][protocol=https]/"
+        if _remux_tier(quality) else ""
     )
     # Preference order:
-    #   0.   (M1/M2 only, >1080p) vp09 HLS pair -> hlspair mode, hw decode
+    #   0.   (M1/M2 >1080p) vp9 webm + AAC -> remux mode, hw decode
     #   1/2. fMP4 pairs (av01 first: better compression + hw decode) -> sidx mode
     #   3.   any https video + m4a audio pair (some sites serve vp9-in-mp4)
     #   4.   best single format at target height (progressive file or HLS)
     #   5.   absolute best anything
     return (
-        vp9_hls +
+        vp9_remux +
         f"bv*{h}[vcodec^=av01][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
         f"bv*{h}[vcodec^=avc1][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
         f"bv*{h}[ext=mp4][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
@@ -246,9 +258,17 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
         audio = next((f for f in fmts if f.get("vcodec") in (None, "none") and f is not video), None)
         if not video or not audio:
             raise RuntimeError("unexpected format pair from yt-dlp")
-        # vp09 HLS pair (M1/M2 >1080p): both URLs are m3u8 playlists, not
-        # byte-range files - proxy them instead of sidx-parsing them.
-        mode = "hlspair" if "m3u8" in (video.get("protocol") or "") else "sidx"
+        vproto = video.get("protocol") or ""
+        vcodec = video.get("vcodec") or ""
+        if video.get("ext") == "webm" or vcodec.startswith("vp9"):
+            # vp9 webm (M1/M2 >1080p): HLS can't carry webm, so repackage the
+            # webm video + m4a audio into fMP4 HLS on the fly (lossless -c copy).
+            mode = "remux"
+        elif "m3u8" in vproto:
+            # already-HLS fMP4 pair (e.g. vp09 mp4 HLS): proxy the playlists.
+            mode = "hlspair"
+        else:
+            mode = "sidx"
         info.update(mode=mode, video=video, audio=audio)
         return info
 
@@ -720,6 +740,261 @@ class CacheDownload:
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
+class VideoRemuxer:
+    """Random-access vp9(webm) -> fMP4 repackaging for smooth >1080p on M1/M2.
+
+    YouTube gives a cookie'd client hw-decodable >1080p only as vp9-in-webm,
+    which HLS can't carry. We repackage on demand: the webm Cues index (at the
+    file head) gives byte offset + time for every DASH segment, so ANY segment
+    can be fetched by HTTP Range and remuxed alone - random access, so seeking
+    anywhere costs one segment fetch, not a wait for sequential download. Every
+    segment shares one canonical fMP4 init; per-segment timing is written into a
+    patched tfdt so the shared-init timeline stays continuous and SenPlayer seeks
+    cleanly. Audio is a separate rendition served byte-range from the m4a sidx.
+    """
+
+    HEAD_BYTES = 4 << 20      # enough to cover EBML+Info+Tracks+Cues+first cluster
+    WORKERS = 4
+    AHEAD = 6                 # segments to prefetch past the last requested one
+    CACHE = 64               # remuxed segments kept in memory (LRU)
+
+    def __init__(self, url: str, proxy: str | None, headers: dict | None, duration: float):
+        from collections import OrderedDict
+        import tempfile
+        self._tmp = tempfile.mkdtemp(prefix="ytplay-vremux-")
+        self.up = Upstream(url, proxy, headers)
+        self.total = self._total_size()
+        head = self.up.fetch_range(0, self.HEAD_BYTES - 1)
+        self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
+        if not self.cues or self.first_cluster is None:
+            raise RuntimeError("webm Cues not found in head")
+        self.header = head[:self.first_cluster]
+        starts = [t for t, _ in self.cues]
+        ends = starts[1:] + [max(duration, starts[-1] + 2.0) if duration else starts[-1] + 4.0]
+        self.segments = [(starts[i], max(0.001, ends[i] - starts[i])) for i in range(len(starts))]
+        # canonical init + mp4 media timescale, from remuxing the first segment
+        init, m4s0 = self._remux(self._mini(0))
+        self.init_bytes = init
+        self.mp4_ts = self._mdhd_timescale(init)
+        self.cache: "OrderedDict[int, bytes]" = OrderedDict()
+        self.cache[0] = self._patch(m4s0, self.segments[0][0])
+        self.lock = threading.Lock()
+        self.inflight: dict[int, threading.Event] = {}
+        self.pool = ThreadPoolExecutor(max_workers=self.WORKERS)
+
+    # -- webm parsing -------------------------------------------------------- #
+    @staticmethod
+    def _rid(b, p):
+        f = b[p]; m = 0x80; l = 1
+        while l <= 4 and not (f & m): m >>= 1; l += 1
+        return int.from_bytes(b[p:p + l], "big"), l
+
+    @staticmethod
+    def _rvint(b, p):
+        f = b[p]; m = 0x80; l = 1
+        while l <= 8 and not (f & m): m >>= 1; l += 1
+        v = f & (m - 1)
+        for i in range(1, l): v = (v << 8) | b[p + i]
+        return v, l
+
+    def _parse(self, d: bytes):
+        rid, rv = self._rid, self._rvint
+        eid, il = rid(d, 0); sz, sl = rv(d, il); p = il + sl + sz      # skip EBML header
+        eid, il = rid(d, p); sz, sl = rv(d, p + il); seg_data = p + il + sl  # Segment
+        tcs = 1000000; cues: list = []; first_cluster = None
+        q = seg_data
+        while q < len(d) - 4:
+            xid, xil = rid(d, q)
+            try: xsz, xsl = rv(d, q + xil)
+            except Exception: break
+            inner = q + xil + xsl
+            if xid == 0x1549A966:                                     # Info
+                r = inner
+                while r < inner + xsz:
+                    yid, yil = rid(d, r); ysz, ysl = rv(d, r + yil)
+                    if yid == 0x2AD7B1:
+                        tcs = int.from_bytes(d[r + yil + ysl:r + yil + ysl + ysz], "big")
+                    r = r + yil + ysl + ysz
+            elif xid == 0x1C53BB6B:                                   # Cues
+                r = inner
+                while r < inner + xsz:
+                    cid, cil = rid(d, r); csz, csl = rv(d, r + cil); ci = r + cil + csl
+                    if cid == 0xBB:                                   # CuePoint
+                        ct = cpos = None; s = ci
+                        while s < ci + csz:
+                            zid, zil = rid(d, s); zsz, zsl = rv(d, s + zil)
+                            if zid == 0xB3:
+                                ct = int.from_bytes(d[s + zil + zsl:s + zil + zsl + zsz], "big")
+                            elif zid == 0xB7:                         # CueTrackPositions
+                                t2 = s + zil + zsl
+                                while t2 < s + zil + zsl + zsz:
+                                    wid, wil = rid(d, t2); wsz, wsl = rv(d, t2 + wil)
+                                    if wid == 0xF1:
+                                        cpos = int.from_bytes(d[t2 + wil + wsl:t2 + wil + wsl + wsz], "big")
+                                    t2 = t2 + wil + wsl + wsz
+                            s = s + zil + zsl + zsz
+                        if ct is not None and cpos is not None:
+                            cues.append((ct * tcs / 1e9, cpos))
+                    r = ci + csz
+            elif xid == 0x1F43B675:                                   # Cluster
+                first_cluster = q; break
+            q = inner + xsz
+        return seg_data, tcs, cues, first_cluster
+
+    def _total_size(self):
+        for i in range(Upstream.RETRIES):
+            try:
+                res = self.up.request("bytes=0-1"); res.read()
+                if getattr(res, "will_close", False): self.up._drop()
+                cr = res.headers.get("Content-Range")
+                if cr and "/" in cr:
+                    return int(cr.rsplit("/", 1)[1])
+            except (http.client.HTTPException, OSError):
+                pass
+            self.up._drop()
+        raise RuntimeError("could not determine webm size")
+
+    # -- remux --------------------------------------------------------------- #
+    def _mini(self, i: int) -> bytes:
+        a = self.seg_data + int(self.cues[i][1])
+        b = (self.seg_data + int(self.cues[i + 1][1]) - 1) if i + 1 < len(self.cues) else (self.total - 1)
+        return self.header + self.up.fetch_range(a, b)
+
+    def _remux(self, mini: bytes):
+        import tempfile
+        d = tempfile.mkdtemp(prefix="seg-", dir=self._tmp)
+        src = os.path.join(d, "in.webm")
+        with open(src, "wb") as f:
+            f.write(mini)
+        # -c copy, no -copyts: timestamps reset to 0 so the init is identical for
+        # every segment (shared EXT-X-MAP); we position each via a patched tfdt.
+        cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", src,
+               "-c", "copy", "-f", "hls", "-hls_time", "99999",
+               "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4",
+               "-hls_segment_filename", os.path.join(d, "s%03d.m4s"),
+               os.path.join(d, "i.m3u8")]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        init_p = os.path.join(d, "init.mp4")
+        segs = sorted(f for f in os.listdir(d) if f.endswith(".m4s"))
+        init = open(init_p, "rb").read() if os.path.exists(init_p) else b""
+        m4s = b"".join(open(os.path.join(d, s), "rb").read() for s in segs)
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+        if not init or not m4s:
+            raise RuntimeError("segment remux produced no output")
+        return init, m4s
+
+    @staticmethod
+    def _mdhd_timescale(init: bytes) -> int:
+        p = init.find(b"mdhd")
+        if p < 0: return 16000
+        ver = init[p + 4]
+        return struct.unpack_from(">I", init, p + 8 + (16 if ver == 1 else 8))[0]
+
+    def _patch(self, m4s: bytes, seconds: float) -> bytes:
+        d = bytearray(m4s); val = round(seconds * self.mp4_ts); p = 0
+        while p + 8 <= len(d):
+            sz = struct.unpack_from(">I", d, p)[0]
+            if d[p + 4:p + 8] == b"moof":
+                q = p + 8
+                while q + 8 <= p + sz:
+                    s2 = struct.unpack_from(">I", d, q)[0]
+                    if d[q + 4:q + 8] == b"traf":
+                        r = q + 8
+                        while r + 8 <= q + s2:
+                            s3 = struct.unpack_from(">I", d, r)[0]
+                            if d[r + 4:r + 8] == b"tfdt":
+                                if d[r + 8] == 1: struct.pack_into(">Q", d, r + 12, val)
+                                else: struct.pack_into(">I", d, r + 12, val)
+                            r += s3
+                    q += s2
+            if sz < 8: break
+            p += sz
+        return bytes(d)
+
+    # -- public -------------------------------------------------------------- #
+    def _produce(self, i: int) -> bytes:
+        init, m4s = self._remux(self._mini(i))
+        return self._patch(m4s, self.segments[i][0])
+
+    def get_segment(self, i: int) -> bytes | None:
+        if i < 0 or i >= len(self.segments):
+            return None
+        with self.lock:
+            if i in self.cache:
+                self.cache.move_to_end(i); data = self.cache[i]
+                mine = None
+            else:
+                ev = self.inflight.get(i)
+                if ev is None:
+                    ev = threading.Event(); self.inflight[i] = ev; mine = True
+                else:
+                    mine = False
+        if mine is None:              # cache hit
+            self._prefetch(i)         # (outside the lock: _prefetch takes it)
+            return data
+        if not mine:
+            ev.wait(timeout=120)
+            with self.lock:
+                return self.cache.get(i)
+        try:
+            data = self._produce(i)
+            with self.lock:
+                self.cache[i] = data; self.cache.move_to_end(i)
+                while len(self.cache) > self.CACHE:
+                    self.cache.popitem(last=False)
+            self._prefetch(i)
+            return data
+        except (RuntimeError, http.client.HTTPException, OSError) as err:
+            log(f"vremux seg {i} failed: {err!r}")
+            return None
+        finally:
+            with self.lock:
+                self.inflight.pop(i, None)
+            ev.set()
+
+    def _prefetch(self, i: int):
+        for j in range(i + 1, min(i + 1 + self.AHEAD, len(self.segments))):
+            with self.lock:
+                if j in self.cache or j in self.inflight:
+                    continue
+                ev = threading.Event(); self.inflight[j] = ev
+            self.pool.submit(self._bg, j, ev)
+
+    def _bg(self, j: int, ev: threading.Event):
+        try:
+            data = self._produce(j)
+            with self.lock:
+                self.cache[j] = data; self.cache.move_to_end(j)
+                while len(self.cache) > self.CACHE:
+                    self.cache.popitem(last=False)
+        except (RuntimeError, http.client.HTTPException, OSError):
+            pass
+        finally:
+            with self.lock:
+                self.inflight.pop(j, None)
+            ev.set()
+
+    def video_playlist(self) -> bytes:
+        import math
+        maxdur = max((d for _, d in self.segments), default=2.0)
+        lines = ["#EXTM3U", "#EXT-X-VERSION:7",
+                 f"#EXT-X-TARGETDURATION:{int(math.ceil(maxdur))}",
+                 "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD",
+                 '#EXT-X-MAP:URI="vinit.mp4"']
+        for i, (_, dur) in enumerate(self.segments):
+            lines.append(f"#EXTINF:{dur:.3f},")
+            lines.append(f"vseg{i}.m4s")
+        lines.append("#EXT-X-ENDLIST")
+        return ("\n".join(lines) + "\n").encode()
+
+    def cleanup(self):
+        import shutil
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+
+
 class LocalGrowingFile:
     """Serve byte ranges from a file yt-dlp is still writing. Same get()/total
     surface as SegmentPrefetcher so the relay handler treats both alike; a
@@ -760,7 +1035,8 @@ class LocalGrowingFile:
 def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
                  hls: HlsFetcher | None, last_activity: dict,
                  cache: CacheDownload | None = None,
-                 prefetchers: dict[str, "SegmentPrefetcher"] | None = None):
+                 prefetchers: dict[str, "SegmentPrefetcher"] | None = None,
+                 remux: "VideoRemuxer | None" = None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -805,6 +1081,21 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
             if playlist is not None:
                 self._send_body(playlist.encode(), "application/vnd.apple.mpegurl")
                 return
+
+            # remux mode video rendition: shared fMP4 init + segments repackaged
+            # on demand from the webm Cues (random access -> seek anywhere fast).
+            if remux and path == "/vinit.mp4":
+                self._send_body(remux.init_bytes, "video/mp4")
+                return
+            if remux and path.startswith("/vseg"):
+                m = re.match(r"/vseg(\d+)\.m4s$", path)
+                if m:
+                    data = remux.get_segment(int(m.group(1)))
+                    if data is None:
+                        self.send_error(404)
+                        return
+                    self._send_body(data, "video/mp4")
+                    return
 
             if path == "/hls.m3u8" and hls and "u" in params:
                 url = _unb64(params["u"][0])
@@ -955,10 +1246,39 @@ def main() -> int:
     upstreams: dict[str, Upstream] = {}
     hls_fetcher: HlsFetcher | None = None
     cache: CacheDownload | None = None
+    remux: VideoRemuxer | None = None
     prefetchers: dict[str, SegmentPrefetcher] = {}
     last_activity = {"t": time.time()}
 
-    if info["mode"] == "sidx":
+    if info["mode"] == "remux":
+        # vp9 webm -> fMP4 (M1/M2 >1080p): video is repackaged on demand from the
+        # webm Cues index (random access -> seek anywhere in ~1 fetch); audio is a
+        # separate rendition served byte-range from the m4a sidx, exactly like sidx
+        # mode. Both are complete VOD playlists -> full seek bar + edge-play.
+        video, audio = info["video"], info["audio"]
+        log(f"mode=remux {video.get('format_id')} {video.get('width')}x{video.get('height')} "
+            f"{video.get('vcodec')} + {audio.get('format_id')} -> fMP4 random-access")
+        a_up = Upstream(audio["url"], proxy, audio.get("http_headers"))
+        try:
+            remux = VideoRemuxer(video["url"], proxy, video.get("http_headers"),
+                                 duration=info.get("duration") or 0)
+            a_init, a_segs = parse_sidx(a_up)
+        except Exception as err:
+            log("remux setup failed: " + repr(err))
+            notify_mac("ytplay failed", "remux setup: " + str(err)[:80])
+            if remux:
+                remux.cleanup()
+            return 1
+        playlists = {
+            "/master.m3u8": master_playlist(video, audio),
+            "/v.m3u8": remux.video_playlist().decode(),
+            "/a.m3u8": media_playlist("a.mp4", a_init, a_segs),
+        }
+        prefetchers = {"/a.mp4": SegmentPrefetcher(a_up, a_init, a_segs, workers=1, ahead=4)}
+        entry = "/master.m3u8"
+        quality_note = f"{video.get('height')}p {(video.get('vcodec') or 'vp9').split('.')[0]} remux"
+
+    elif info["mode"] == "sidx":
         video, audio = info["video"], info["audio"]
         log(f"mode=sidx {video.get('format_id')} {video.get('width')}x{video.get('height')} "
             f"{video.get('vcodec')} + {audio.get('format_id')}")
@@ -1102,7 +1422,7 @@ def main() -> int:
     log(f"ready in {time.time() - t0:.1f}s")
 
     handler = make_handler(playlists, upstreams, hls_fetcher, last_activity, cache,
-                           prefetchers)
+                           prefetchers, remux)
     srv = RelayServer(("127.0.0.1", args.port), handler)
     local_url = f"http://127.0.0.1:{srv.server_address[1]}" + entry
     log("serving " + local_url)
@@ -1134,6 +1454,8 @@ def main() -> int:
     finally:
         if cache is not None:
             cache.cleanup()
+        if remux is not None:
+            remux.cleanup()
     return 0
 
 
