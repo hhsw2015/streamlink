@@ -227,17 +227,23 @@ def format_selector(quality: str, enhance: bool = False) -> str:
         f"bv*{h}[vcodec^=vp9][ext=webm]+ba[ext=m4a][protocol=https]/"
         if (_remux_tier(quality) or enhance) else ""
     )
+    # Enhance: prefer a muxed HLS single format over a progressive file -
+    # muxed HLS goes through the native tier (HlsRemuxer, per-segment enhance,
+    # fast seek); progressive would fall back to the slow sequential pipe.
+    hls_muxed = f"b{h}[protocol^=m3u8]/" if enhance else ""
     # Preference order:
-    #   0.   (M1/M2 >1080p) vp9 webm + AAC -> remux mode, hw decode
+    #   0.   (M1/M2 >1080p or enhance) vp9 webm + AAC -> remux mode, hw decode
     #   1/2. fMP4 pairs (av01 first: better compression + hw decode) -> sidx mode
     #   3.   any https video + m4a audio pair (some sites serve vp9-in-mp4)
-    #   4.   best single format at target height (progressive file or HLS)
-    #   5.   absolute best anything
+    #   4.   (enhance) muxed HLS single format -> native HlsRemuxer
+    #   5.   best single format at target height (progressive file or HLS)
+    #   6.   absolute best anything
     return (
         vp9_remux +
         f"bv*{h}[vcodec^=av01][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
         f"bv*{h}[vcodec^=avc1][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
         f"bv*{h}[ext=mp4][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
+        + hls_muxed +
         f"b{h}/b"
     )
 
@@ -1380,10 +1386,19 @@ class VideoRemuxer:
             ow, oh, _ = self.enhance
             mbit = 25 if oh >= 2000 else 16 if oh >= 1400 else 10
             frag = os.path.join(d, "in.mp4")
-            fres = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
-                                   "-i", src, "-c", "copy", "-f", "mp4",
-                                   "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-                                   frag], stdout=subprocess.DEVNULL,
+            fcmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
+                    "-i", src, "-c", "copy"]
+            movflags = "frag_keyframe+empty_moov+default_base_moof"
+            if getattr(self, "muxed", False):
+                # TS sources carry ADTS AAC; mp4 needs it converted to ASC.
+                # Harmless for sources already in ASC (filter passes through).
+                # delay_moov: with empty_moov the moov is written before the
+                # first AAC packet, leaving esds without DecoderSpecificInfo -
+                # AVFoundation then reports NO audio track (silent drop).
+                fcmd += ["-bsf:a", "aac_adtstoasc"]
+                movflags = "frag_keyframe+delay_moov+default_base_moof"
+            fcmd += ["-f", "mp4", "-movflags", movflags, frag]
+            fres = subprocess.run(fcmd, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.PIPE, text=True)
             frag_ok = fres.returncode == 0 and os.path.exists(frag) and os.path.getsize(frag) > 0
             if not frag_ok:
@@ -1724,7 +1739,7 @@ class HlsRemuxer(VideoRemuxer):
         hdrs = {k: v for k, v in self.up.headers.items() if k != "User-Agent"}
         self._hls = HlsFetcher(proxy, hdrs)
         base = self.up.url
-        text = self._hls.open(base).read().decode("utf-8", "replace")
+        text = self._fetch_url(base).decode("utf-8", "replace")
         init_url = None
         seg_urls: list[str] = []
         durs: list[float] = []
@@ -1747,7 +1762,7 @@ class HlsRemuxer(VideoRemuxer):
         if not seg_urls:
             raise RuntimeError("HLS media playlist has no segments")
         self._seg_urls = seg_urls
-        self._src_init = self._hls.open(init_url).read() if init_url else b""
+        self._src_init = self._fetch_url(init_url) if init_url else b""
         starts, t = [], 0.0
         for d in durs:
             starts.append(t)
@@ -1755,8 +1770,20 @@ class HlsRemuxer(VideoRemuxer):
         self.segments = [(starts[i], max(0.001, durs[i])) for i in range(len(seg_urls))]
         self.total = 0
 
+    def _fetch_url(self, url: str) -> bytes:
+        # Rotating-proxy resilience: each retry rides a fresh connection (and
+        # therefore usually a fresh exit); some sites 4xx per-exit (PH 410/474).
+        err: Exception | None = None
+        for k in range(6):
+            try:
+                return self._hls.open(url).read()
+            except Exception as exc:  # noqa: BLE001 - urllib raises broadly
+                err = exc
+                time.sleep(min(0.5, 0.15 * (k + 1)))
+        raise err or RuntimeError("hls fetch failed")
+
     def _mini(self, i: int, parallel: bool = True) -> bytes:
-        return self._src_init + self._hls.open(self._seg_urls[i]).read()
+        return self._src_init + self._fetch_url(self._seg_urls[i])
 
 
 class EnhancePipe:
