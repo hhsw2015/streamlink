@@ -976,7 +976,7 @@ class VideoRemuxer:
         # (fresh threads would pay the ~1s proxy TLS handshake per chunk). FIFO
         # order doubles as priority: the awaited segment's chunks enqueue first.
         # 12 workers ~ 3 segments x 4 chunks each downloading truly concurrently.
-        self.chunk_pool = ThreadPoolExecutor(max_workers=12)
+        self.chunk_pool = ThreadPoolExecutor(max_workers=24)
         # canonical init + mp4 timescale come from remuxing segment 0; run in the
         # background so server startup overlaps the player launching
         self.init_bytes = b""
@@ -1661,7 +1661,8 @@ class VideoRemuxer:
             # starve the segment the player is waiting on). Downloads are ~2x
             # realtime so hot=2 keeps the GPU fed.
             ahead = 3
-            hot = 2
+            hot = 1   # only 1 prefetch segment parallel-downloads, leaving
+                      # connection-pool capacity free for a foreground seek
         else:
             ahead = self.AHEAD
         for j in range(i + 1, min(i + 1 + ahead, len(self.segments))):
@@ -1894,7 +1895,13 @@ class HlsRemuxer(VideoRemuxer):
     # SenPlayer only plays audio declared as a separate rendition, so we extract
     # the source audio per segment (ffmpeg copy, no GPU) with a canonical init
     # and per-segment tfdt, exactly like the video side.
-    def _audio_extract(self, i: int):
+    def _audio_extract(self, i: int) -> tuple[bytes, list[bytes]]:
+        """Extract source segment i's audio, split into SUB_S sub-segments.
+
+        Audio is sub-segmented to match the video grain: a seek then resumes
+        after one shared source download + the first ~1s audio sub, instead of
+        waiting for whole 8.5s audio segments (the real seek bottleneck).
+        """
         import tempfile, shutil
         d = tempfile.mkdtemp(prefix="aud-", dir=self._tmp)
         src = os.path.join(d, self.SRC_NAME)
@@ -1903,18 +1910,18 @@ class HlsRemuxer(VideoRemuxer):
         outd = os.path.join(d, "out"); os.makedirs(outd)
         cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", src,
                "-map", "0:a:0", "-c:a", "copy", "-bsf:a", "aac_adtstoasc",
-               "-f", "hls", "-hls_time", "99999", "-hls_segment_type", "fmp4",
-               "-hls_flags", "delete_segments",
+               "-f", "hls", "-hls_time", str(self.SUB_S),
+               "-hls_segment_type", "fmp4",
                "-hls_fmp4_init_filename", "init.mp4",
                "-hls_segment_filename", os.path.join(outd, "a%03d.m4s"),
                os.path.join(outd, "a.m3u8")]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         ip = os.path.join(outd, "init.mp4")
-        segs = sorted(f for f in os.listdir(outd) if f.endswith(".m4s"))
+        names = sorted(f for f in os.listdir(outd) if f.endswith(".m4s"))
         init = open(ip, "rb").read() if os.path.exists(ip) else b""
-        m4s = b"".join(open(os.path.join(outd, s), "rb").read() for s in segs)
+        subs = [open(os.path.join(outd, s), "rb").read() for s in names]
         shutil.rmtree(d, ignore_errors=True)
-        return init, m4s
+        return init, subs
 
     def audio_init(self) -> bytes:
         if getattr(self, "_a_init", None) is None:
@@ -1923,41 +1930,69 @@ class HlsRemuxer(VideoRemuxer):
             self._a_ts = self._mdhd_timescale(init)
         return self._a_init
 
-    def audio_segment(self, i: int) -> bytes | None:
-        if i < 0 or i >= len(self.segments):
-            return None
+    def _audio_produce(self, i: int) -> dict:
+        """Produce {sub_index: bytes} for segment i's audio (cached)."""
         if not hasattr(self, "_a_cache"):
             from collections import OrderedDict
-            self._a_cache: "OrderedDict[int, bytes]" = OrderedDict()
+            self._a_cache: "OrderedDict[int, dict]" = OrderedDict()
+            self._a_inflight: dict[int, threading.Event] = {}
         with self.lock:
             if i in self._a_cache:
                 self._a_cache.move_to_end(i)
                 return self._a_cache[i]
-        self.audio_init()  # ensure timescale known
+            ev = self._a_inflight.get(i)
+            mine = ev is None
+            if mine:
+                ev = threading.Event(); self._a_inflight[i] = ev
+        if not mine:
+            ev.wait(timeout=90)
+            with self.lock:
+                return self._a_cache.get(i, {})
+        self.audio_init()
+        out: dict = {}
         try:
-            _init, m4s = self._audio_extract(i)
+            _init, subs = self._audio_extract(i)
+            base = self.segments[i][0]
+            for m, sub in enumerate(subs):
+                local = self._read_tfdt(sub) / (self._a_ts or 90000)
+                out[m] = self._patch(sub, base + local, ts=self._a_ts)
         except (RuntimeError, OSError) as err:
             log(f"audio seg {i} failed: {err!r}")
+        finally:
+            with self.lock:
+                if out:
+                    self._a_cache[i] = out
+                    while len(self._a_cache) > 12:
+                        self._a_cache.popitem(last=False)
+                self._a_inflight.pop(i, None)
+            ev.set()
+        return out
+
+    def audio_sub(self, i: int, m: int) -> bytes | None:
+        if i < 0 or i >= len(self.segments):
             return None
-        if not m4s:
-            return None
-        data = self._patch(m4s, self.segments[i][0], ts=self._a_ts)
-        with self.lock:
-            self._a_cache[i] = data
-            while len(self._a_cache) > 24:
-                self._a_cache.popitem(last=False)
-        return data
+        subs = self._audio_produce(i)
+        n = self.subcount(i)
+        if m < n - 1:
+            return subs.get(m)
+        # last advertised sub absorbs any extra actual subs
+        tail = [subs[k] for k in sorted(subs) if k >= m]
+        return b"".join(tail) if tail else None
+
+    # background warm reuses _audio_produce (whole segment at once)
+    def audio_segment(self, i: int):
+        self._audio_produce(i)
 
     def audio_playlist(self) -> bytes:
-        import math
-        maxdur = max((d for _, d in self.segments), default=8.0)
-        lines = ["#EXTM3U", "#EXT-X-VERSION:7",
-                 f"#EXT-X-TARGETDURATION:{int(math.ceil(maxdur))}",
+        lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:3",
                  "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD",
                  '#EXT-X-MAP:URI="ainit.mp4"']
         for i, (_, dur) in enumerate(self.segments):
-            lines.append(f"#EXTINF:{dur:.3f},")
-            lines.append(f"aseg{i}.m4s")
+            n = self.subcount(i)
+            per = dur / n
+            for m in range(n):
+                lines.append(f"#EXTINF:{per:.3f},")
+                lines.append(f"aseg{i}_{m}.m4s")
         lines.append("#EXT-X-ENDLIST")
         return ("\n".join(lines) + "\n").encode()
 
@@ -2229,10 +2264,10 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 return
-            if remux and path.startswith("/aseg") and hasattr(remux, "audio_segment"):
-                m = re.match(r"/aseg(\d+)\.m4s$", path)
+            if remux and path.startswith("/aseg") and hasattr(remux, "audio_sub"):
+                m = re.match(r"/aseg(\d+)_(\d+)\.m4s$", path)
                 if m:
-                    data = remux.audio_segment(int(m.group(1)))
+                    data = remux.audio_sub(int(m.group(1)), int(m.group(2)))
                     if data is None:
                         self.send_error(404)
                         return
@@ -2251,13 +2286,16 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
                         # otherwise a seek pays a cold proxy fetch for audio
                         # AFTER the video buffer is already filled
                         ap.warm_at(remux.segments[si][0] + sm * remux.SUB_S)
-                    # Muxed HLS: warm this segment's separate audio rendition (and
-                    # the next) in the background so a seek's audio is ready by the
-                    # time the player requests it - reuses the cached raw segment.
+                    # Muxed HLS: players buffer several whole audio segments on
+                    # seek, each an 8.5s source download. Warm a few ahead IN
+                    # PARALLEL (they share the raw-segment cache + parallel Range
+                    # download) so they arrive together instead of serially -
+                    # audio, not video, was the seek bottleneck.
                     if sm == 0 and hasattr(remux, "audio_segment"):
-                        for aj in (si, si + 1):
-                            threading.Thread(target=remux.audio_segment,
-                                             args=(aj,), daemon=True).start()
+                        for aj in range(si, si + 4):
+                            if aj < len(remux.segments):
+                                threading.Thread(target=remux.audio_segment,
+                                                 args=(aj,), daemon=True).start()
                     data = remux.get_sub(si, sm)
                     if data is None:
                         self.send_error(404)
