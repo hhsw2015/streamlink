@@ -885,6 +885,11 @@ class VideoRemuxer:
         # one of those takes the GPU next, every other background job yields.
         self.gpu_lock = threading.Lock()
         self.fg_want: set[int] = set()
+        # Sub-segment early publish: while vtenhance splits a segment into ~2s
+        # sub-segments (--seg-interval), finished subs land here so a seeking
+        # player starts after the FIRST sub instead of the whole segment.
+        self.partial: dict[int, list[bytes]] = {}
+        self.pcond = threading.Condition()
         self.up = Upstream(url, proxy, headers)
         head, self.total = self._fetch_head()  # one request: head bytes + file size
         self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
@@ -926,12 +931,12 @@ class VideoRemuxer:
 
     def _bootstrap(self, ev: threading.Event):
         try:
-            init, m4s0 = self._remux(self._mini(0))
+            init, subs0 = self._remux(self._mini(0), seg_idx=0)
             self.init_bytes = init
             self.mp4_ts = self._mdhd_timescale(init)
             self._init_ready.set()
             with self.lock:
-                self._store(0, self._patch(m4s0, self.segments[0][0]))
+                self._store(0, subs0)
         except Exception as err:  # noqa: BLE001 - background thread boundary
             log("vremux bootstrap failed: " + repr(err))
         finally:
@@ -940,13 +945,16 @@ class VideoRemuxer:
                 if self.inflight.get(0) is ev:
                     self.inflight.pop(0)
                 self.started.discard(0)
+            with self.pcond:
+                self.partial.pop(0, None)
+                self.pcond.notify_all()
             ev.set()
 
     def get_init(self) -> bytes | None:
         self._init_ready.wait(timeout=90)
         if not self.init_bytes:
             try:  # bootstrap failed: one synchronous retry
-                init, _m4s0 = self._remux(self._mini(0))
+                init, _subs0 = self._remux(self._mini(0), seg_idx=0)
                 self.init_bytes = init
                 self.mp4_ts = self._mdhd_timescale(init)
             except Exception as err:  # noqa: BLE001 - reported to the player as 404
@@ -954,16 +962,16 @@ class VideoRemuxer:
                 return None
         return self.init_bytes
 
-    def _store(self, i: int, data: bytes) -> None:
+    def _store(self, i: int, subs: list) -> None:
         """Insert into the LRU under self.lock, evicting past the byte cap."""
         old = self.cache.pop(i, None)
         if old is not None:
-            self.cached_bytes -= len(old)
-        self.cache[i] = data
-        self.cached_bytes += len(data)
+            self.cached_bytes -= sum(map(len, old))
+        self.cache[i] = subs
+        self.cached_bytes += sum(map(len, subs))
         while self.cached_bytes > self.CACHE_BYTES and len(self.cache) > 1:
             _k, v = self.cache.popitem(last=False)
-            self.cached_bytes -= len(v)
+            self.cached_bytes -= sum(map(len, v))
 
     # -- webm parsing -------------------------------------------------------- #
     @staticmethod
@@ -1112,6 +1120,89 @@ class VideoRemuxer:
             self.gpu_lock.release()
             time.sleep(0.05)
 
+    def _publish_partials(self, i: int, outd: str, stop: threading.Event):
+        """Poll vtenhance's output dir; publish finished sub-segments early.
+
+        Runs while vtenhance enhances segment i. Each completed ~2s sub-segment
+        is tfdt-patched and appended to self.partial[i] so get_sub() can serve
+        it immediately - a seeking player resumes after the first sub instead
+        of waiting for the whole segment.
+        """
+        seen = 0
+        ts: int | None = None
+        seg_start = self.segments[i][0]
+        while True:
+            stopped = stop.is_set()
+            try:
+                files = sorted(f for f in os.listdir(outd) if f.endswith(".m4s"))
+            except OSError:
+                files = []
+            if ts is None:
+                ip = os.path.join(outd, "init.mp4")
+                if os.path.exists(ip):
+                    try:
+                        ts = self._mdhd_timescale(open(ip, "rb").read())
+                    except OSError:
+                        pass
+            for f in files[seen:]:
+                try:
+                    sub = open(os.path.join(outd, f), "rb").read()
+                except OSError:
+                    break
+                if not sub:
+                    break
+                local = self._read_tfdt(sub) / (ts or 90000)
+                patched = self._patch(sub, seg_start + local, ts=ts)
+                with self.pcond:
+                    self.partial.setdefault(i, []).append(patched)
+                    self.pcond.notify_all()
+                seen += 1
+            if stopped:
+                return
+            stop.wait(0.15)
+
+    def subcount(self, i: int) -> int:
+        """Advertised sub-segments for segment i (native enhance playlists).
+
+        floor(dur/2) never exceeds what vtenhance actually emits (encoder
+        keyframes are forced to <=2s, so every 2s boundary produces a split);
+        the last advertised sub absorbs any extra actual subs.
+        """
+        return max(1, int(self.segments[i][1] // 2))
+
+    def get_sub(self, i: int, m: int) -> bytes | None:
+        """Sub-segment m of segment i; serves early from partials during enhance."""
+        if i < 0 or i >= len(self.segments):
+            return None
+        n = self.subcount(i)
+        if m < 0 or m >= n:
+            return None
+        with self.lock:
+            cached = self.cache.get(i)
+            producing = i in self.inflight
+        if cached is None and not producing:
+            # kick off full-segment production (claims, fg priority, prefetch)
+            threading.Thread(target=self.get_segment, args=(i,), daemon=True).start()
+        elif cached is not None:
+            self._prefetch(i)
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            with self.lock:
+                subs = self.cache.get(i)
+                if subs is not None:
+                    self.cache.move_to_end(i)
+            if subs is not None:
+                a = len(subs)
+                if m >= a:
+                    return None      # pathological undershoot: 404 this sub
+                return subs[m] if m < n - 1 else b"".join(subs[m:])
+            with self.pcond:
+                part = self.partial.get(i)
+                if part and len(part) > m and m < n - 1:
+                    return part[m]   # last advertised sub needs the full set
+                self.pcond.wait(0.5)
+        return None
+
     def _remux(self, mini: bytes, seg_idx: int = -1):
         import tempfile
         d = tempfile.mkdtemp(prefix="seg-", dir=self._tmp)
@@ -1137,8 +1228,10 @@ class VideoRemuxer:
             if not frag_ok:
                 tail = (fres.stderr or "").strip().splitlines()[-1:] or ["?"]
                 log(f"enhance frag step failed (rc={fres.returncode}): {tail[0][:200]}")
-            cmd = [_vtenhance_path() or "vtenhance", frag, d, "--hls",
-                   "--scale", f"{ow}x{oh}", "--bitrate", str(mbit)]
+            outd = os.path.join(d, "out")
+            os.makedirs(outd, exist_ok=True)
+            cmd = [_vtenhance_path() or "vtenhance", frag, outd, "--hls",
+                   "--seg-interval", "2", "--scale", f"{ow}x{oh}", "--bitrate", str(mbit)]
         elif self.enhance:
             # GPU upscale this segment (VideoToolbox decode -> Metal shader ->
             # VideoToolbox HEVC encode). Per-segment, so seeking anywhere only
@@ -1160,13 +1253,23 @@ class VideoRemuxer:
                    "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4",
                    "-hls_segment_filename", os.path.join(d, "s%03d.m4s"),
                    os.path.join(d, "i.m3u8")]
+        native = self.enhance is not None and self.enhance[2] == "native"
         if self.enhance:
             self._gpu_acquire(seg_idx)
+            stop_pub = threading.Event()
+            pub = None
+            if native and seg_idx >= 0:
+                pub = threading.Thread(target=self._publish_partials,
+                                       args=(seg_idx, outd, stop_pub), daemon=True)
+                pub.start()
             try:
                 res = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE, text=True)
             finally:
                 self.gpu_lock.release()
+                stop_pub.set()
+                if pub:
+                    pub.join(timeout=5)
             if res.returncode != 0:
                 tail = (res.stderr or "").strip().splitlines()[-1:] or ["?"]
                 log(f"enhance segment failed (rc={res.returncode}): {tail[0][:200]}")
@@ -1177,15 +1280,18 @@ class VideoRemuxer:
                     log(f"enhance debug: inputs kept at {keep}")
         else:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        init_p = os.path.join(d, "init.mp4")
-        segs = sorted(f for f in os.listdir(d) if f.endswith(".m4s"))
+        srcdir = outd if (native and self.enhance) else d
+        init_p = os.path.join(srcdir, "init.mp4")
+        segs = sorted(f for f in os.listdir(srcdir) if f.endswith(".m4s"))
         init = open(init_p, "rb").read() if os.path.exists(init_p) else b""
-        m4s = b"".join(open(os.path.join(d, s), "rb").read() for s in segs)
+        subs = [open(os.path.join(srcdir, f), "rb").read() for f in segs]
         import shutil
         shutil.rmtree(d, ignore_errors=True)
-        if not init or not m4s:
+        if not init or not subs or not all(subs):
             raise RuntimeError("segment remux produced no output")
-        return init, m4s
+        if not native:
+            subs = [b"".join(subs)]  # ffmpeg paths emit one segment
+        return init, subs
 
     @staticmethod
     def _mdhd_timescale(init: bytes) -> int:
@@ -1194,8 +1300,8 @@ class VideoRemuxer:
         ver = init[p + 4]
         return struct.unpack_from(">I", init, p + 8 + (16 if ver == 1 else 8))[0]
 
-    def _patch(self, m4s: bytes, seconds: float) -> bytes:
-        d = bytearray(m4s); val = round(seconds * self.mp4_ts); p = 0
+    def _patch(self, m4s: bytes, seconds: float, ts: int | None = None) -> bytes:
+        d = bytearray(m4s); val = round(seconds * (ts or self.mp4_ts)); p = 0
         while p + 8 <= len(d):
             sz = struct.unpack_from(">I", d, p)[0]
             if d[p + 4:p + 8] == b"moof":
@@ -1216,9 +1322,29 @@ class VideoRemuxer:
         return bytes(d)
 
     # -- public -------------------------------------------------------------- #
-    def _produce(self, i: int, parallel: bool = True) -> bytes:
-        init, m4s = self._remux(self._mini(i, parallel=parallel), seg_idx=i)
-        return self._patch(m4s, self.segments[i][0])
+    def _produce(self, i: int, parallel: bool = True) -> list:
+        init, subs = self._remux(self._mini(i, parallel=parallel), seg_idx=i)
+        return self._patch_subs(subs, self.segments[i][0])
+
+    def _patch_subs(self, subs: list, seg_start: float) -> list:
+        """tfdt-position each sub-segment at seg_start + its offset in the seg.
+
+        Sub boundaries come from the subs' own baseMediaDecodeTime deltas
+        (vtenhance encodes from 0), so audio-video sync survives splitting.
+        """
+        out = []
+        for sub in subs:
+            local = self._read_tfdt(sub) / self.mp4_ts  # seconds inside the seg
+            out.append(self._patch(sub, seg_start + local))
+        return out
+
+    @staticmethod
+    def _read_tfdt(m4s: bytes) -> int:
+        p = m4s.find(b"tfdt")
+        if p < 0:
+            return 0
+        ver = m4s[p + 4]
+        return struct.unpack_from(">Q" if ver == 1 else ">I", m4s, p + 8)[0]
 
     def get_segment(self, i: int) -> bytes | None:
         if i < 0 or i >= len(self.segments):
@@ -1244,7 +1370,7 @@ class VideoRemuxer:
                     mine = False
         if mine is None:              # cache hit
             self._prefetch(i)         # (outside the lock: _prefetch takes it)
-            return data
+            return b"".join(data)
         # The player is now blocked on segment i: give whichever job produces
         # it (this thread or a background one already running) GPU priority.
         with self.lock:
@@ -1253,13 +1379,14 @@ class VideoRemuxer:
             if not mine:              # actively producing in the background
                 ev.wait(timeout=120)
                 with self.lock:
-                    return self.cache.get(i)
+                    got = self.cache.get(i)
+                    return b"".join(got) if got is not None else None
             try:
                 data = self._produce(i)
                 with self.lock:
                     self._store(i, data)
                 self._prefetch(i)
-                return data
+                return b"".join(data)
             except (RuntimeError, http.client.HTTPException, OSError) as err:
                 log(f"vremux seg {i} failed: {err!r}")
                 return None
@@ -1268,6 +1395,9 @@ class VideoRemuxer:
                     if self.inflight.get(i) is ev:
                         self.inflight.pop(i)
                     self.started.discard(i)
+                with self.pcond:
+                    self.partial.pop(i, None)
+                    self.pcond.notify_all()
                 ev.set()
         finally:
             with self.lock:
@@ -1310,10 +1440,28 @@ class VideoRemuxer:
                 if self.inflight.get(j) is ev:
                     self.inflight.pop(j)
                 self.started.discard(j)
+            with self.pcond:
+                self.partial.pop(j, None)
+                self.pcond.notify_all()
             ev.set()
 
     def video_playlist(self) -> bytes:
         import math
+        native = self.enhance is not None and self.enhance[2] == "native"
+        if native:
+            # Advertise ~2s sub-segments (vsegI_M.m4s): a seek needs only the
+            # first sub of the target segment, not the whole enhanced segment.
+            lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:3",
+                     "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD",
+                     '#EXT-X-MAP:URI="vinit.mp4"']
+            for i, (_, dur) in enumerate(self.segments):
+                n = self.subcount(i)
+                per = dur / n
+                for m in range(n):
+                    lines.append(f"#EXTINF:{per:.3f},")
+                    lines.append(f"vseg{i}_{m}.m4s")
+            lines.append("#EXT-X-ENDLIST")
+            return ("\n".join(lines) + "\n").encode()
         maxdur = max((d for _, d in self.segments), default=2.0)
         lines = ["#EXTM3U", "#EXT-X-VERSION:7",
                  f"#EXT-X-TARGETDURATION:{int(math.ceil(maxdur))}",
@@ -1584,6 +1732,17 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
                     pass
                 return
             if remux and path.startswith("/vseg"):
+                m = re.match(r"/vseg(\d+)_(\d+)\.m4s$", path)
+                if m:
+                    data = remux.get_sub(int(m.group(1)), int(m.group(2)))
+                    if data is None:
+                        self.send_error(404)
+                        return
+                    try:
+                        self._send_body(data, "video/mp4")
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
                 m = re.match(r"/vseg(\d+)\.m4s$", path)
                 if m:
                     data = remux.get_segment(int(m.group(1)))
