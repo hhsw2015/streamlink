@@ -934,18 +934,6 @@ class VideoRemuxer:
         # source-agnostic, so any source that provides fMP4 segments gets the
         # full native path - "use native whenever the format allows".
         self._build_index(duration)
-        # Frame interpolation ~halves GPU throughput. On coarse segments (e.g.
-        # PornHub's 8.5s TS) the per-segment enhance then can't stay ahead of
-        # playback and it stutters. Keep 60fps only when segments are small
-        # enough to sustain it; otherwise fall back to a smooth 4K30.
-        if self.enhance and "fps2x" in self.enhance[2] and self.segments:
-            import statistics
-            med = statistics.median(d for _, d in self.segments)
-            if med > 4.0:
-                ow, oh, ms = self.enhance
-                self.enhance = (ow, oh, ms.replace(":fps2x", ""))
-                log(f"enhance: {med:.1f}s segments too coarse for 60fps interp "
-                    f"-> smooth 4K30")
         self.cache: "OrderedDict[int, bytes]" = OrderedDict()
         self.cached_bytes = 0
         self.lock = threading.Lock()
@@ -1426,8 +1414,9 @@ class VideoRemuxer:
             cmd += NATIVE_TIERS.get(tier, [])
             if "fps2x" in parts:
                 cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps
-            if getattr(self, "muxed", False):
-                cmd += ["--audio"]               # muxed source: keep its audio
+            # (muxed sources serve audio as a SEPARATE rendition - SenPlayer
+            # only plays EXT-X-MEDIA audio, not audio muxed in the variant - so
+            # the enhance pass stays video-only here.)
             if sub_from > 0:
                 # Seek landed mid-segment: enhance only from that sub onward.
                 cmd += ["--start", str(sub_from * self.SUB_S)]
@@ -1636,13 +1625,14 @@ class VideoRemuxer:
         with self.lock:
             gen = self.gen
         if self.enhance:
-            # GPU is only ~1.3x realtime, so a deep enhance backlog starves the
-            # segment the player needs next. Keep ~one segment's lead: with big
-            # segments (PH ~8.5s) that's ahead=1; with small ones (~2s) allow a
-            # few so the pipeline stays full. hot (parallel download) tracks it.
-            seg_dur = self.segments[i][1] if i < len(self.segments) else 2.0
-            ahead = max(1, min(4, int(8.0 / max(seg_dur, 1.0))))
-            hot = 1
+            # fps2x sustains ~1.28x realtime, so the GPU CAN stay ahead - but it
+            # must be kept continuously busy building a lead, not idle between
+            # foreground requests. Prefetch a steady multi-segment lead
+            # (strict playhead-order scheduling means far-ahead jobs never
+            # starve the segment the player is waiting on). Downloads are ~2x
+            # realtime so hot=2 keeps the GPU fed.
+            ahead = 3
+            hot = 2
         else:
             ahead = self.AHEAD
         for j in range(i + 1, min(i + 1 + ahead, len(self.segments))):
@@ -1805,6 +1795,77 @@ class HlsRemuxer(VideoRemuxer):
 
     def _mini(self, i: int, parallel: bool = True) -> bytes:
         return self._src_init + self._fetch_url(self._seg_urls[i])
+
+    # --- separate audio rendition (muxed source -> its own EXT-X-MEDIA group) --
+    # SenPlayer only plays audio declared as a separate rendition, so we extract
+    # the source audio per segment (ffmpeg copy, no GPU) with a canonical init
+    # and per-segment tfdt, exactly like the video side.
+    def _audio_extract(self, i: int):
+        import tempfile, shutil
+        d = tempfile.mkdtemp(prefix="aud-", dir=self._tmp)
+        src = os.path.join(d, self.SRC_NAME)
+        with open(src, "wb") as f:
+            f.write(self._mini(i))
+        outd = os.path.join(d, "out"); os.makedirs(outd)
+        cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", src,
+               "-map", "0:a:0", "-c:a", "copy", "-bsf:a", "aac_adtstoasc",
+               "-f", "hls", "-hls_time", "99999", "-hls_segment_type", "fmp4",
+               "-hls_flags", "delete_segments",
+               "-hls_fmp4_init_filename", "init.mp4",
+               "-hls_segment_filename", os.path.join(outd, "a%03d.m4s"),
+               os.path.join(outd, "a.m3u8")]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ip = os.path.join(outd, "init.mp4")
+        segs = sorted(f for f in os.listdir(outd) if f.endswith(".m4s"))
+        init = open(ip, "rb").read() if os.path.exists(ip) else b""
+        m4s = b"".join(open(os.path.join(outd, s), "rb").read() for s in segs)
+        shutil.rmtree(d, ignore_errors=True)
+        return init, m4s
+
+    def audio_init(self) -> bytes:
+        if getattr(self, "_a_init", None) is None:
+            init, _ = self._audio_extract(0)
+            self._a_init = init
+            self._a_ts = self._mdhd_timescale(init)
+        return self._a_init
+
+    def audio_segment(self, i: int) -> bytes | None:
+        if i < 0 or i >= len(self.segments):
+            return None
+        if not hasattr(self, "_a_cache"):
+            from collections import OrderedDict
+            self._a_cache: "OrderedDict[int, bytes]" = OrderedDict()
+        with self.lock:
+            if i in self._a_cache:
+                self._a_cache.move_to_end(i)
+                return self._a_cache[i]
+        self.audio_init()  # ensure timescale known
+        try:
+            _init, m4s = self._audio_extract(i)
+        except (RuntimeError, OSError) as err:
+            log(f"audio seg {i} failed: {err!r}")
+            return None
+        if not m4s:
+            return None
+        data = self._patch(m4s, self.segments[i][0], ts=self._a_ts)
+        with self.lock:
+            self._a_cache[i] = data
+            while len(self._a_cache) > 24:
+                self._a_cache.popitem(last=False)
+        return data
+
+    def audio_playlist(self) -> bytes:
+        import math
+        maxdur = max((d for _, d in self.segments), default=8.0)
+        lines = ["#EXTM3U", "#EXT-X-VERSION:7",
+                 f"#EXT-X-TARGETDURATION:{int(math.ceil(maxdur))}",
+                 "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD",
+                 '#EXT-X-MAP:URI="ainit.mp4"']
+        for i, (_, dur) in enumerate(self.segments):
+            lines.append(f"#EXTINF:{dur:.3f},")
+            lines.append(f"aseg{i}.m4s")
+        lines.append("#EXT-X-ENDLIST")
+        return ("\n".join(lines) + "\n").encode()
 
 
 class EnhancePipe:
@@ -2067,6 +2128,25 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 return
+            # Separate audio rendition for muxed-HLS native (HlsRemuxer).
+            if remux and path == "/ainit.mp4" and hasattr(remux, "audio_init"):
+                try:
+                    self._send_body(remux.audio_init(), "video/mp4")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            if remux and path.startswith("/aseg") and hasattr(remux, "audio_segment"):
+                m = re.match(r"/aseg(\d+)\.m4s$", path)
+                if m:
+                    data = remux.audio_segment(int(m.group(1)))
+                    if data is None:
+                        self.send_error(404)
+                        return
+                    try:
+                        self._send_body(data, "video/mp4")
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
             if remux and path.startswith("/vseg"):
                 m = re.match(r"/vseg(\d+)_(\d+)\.m4s$", path)
                 if m:
@@ -2474,17 +2554,19 @@ def main() -> int:
             log("hls native setup failed: " + repr(err))
             notify_mac("ytplay failed", "hls native: " + str(err)[:80])
             return 1
-        mvid = dict(media, vcodec="hvc1.2.4.L153.B0", width=ow, height=oh)
         bandwidth = int((media.get("tbr") or 6000) * 1000)
         playlists = {
             "/master.m3u8": "\n".join([
                 "#EXTM3U",
+                '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="audio",DEFAULT=YES,'
+                'AUTOSELECT=YES,URI="a.m3u8"',
                 f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},'
                 f'CODECS="hvc1.2.4.L153.B0,mp4a.40.2",'
-                f'RESOLUTION={ow}x{oh}',
+                f'RESOLUTION={ow}x{oh},AUDIO="a"',
                 "v.m3u8",
             ]) + "\n",
             "/v.m3u8": remux.video_playlist().decode(),
+            "/a.m3u8": remux.audio_playlist().decode(),
         }
         entry = "/master.m3u8"
         quality_note = f"{oh}p enhanced (native muxed)"
