@@ -638,6 +638,20 @@ class SegmentPrefetcher:
                     return
             self.pool.submit(self._fetch, idx)
 
+    def warm_at(self, seconds: float, count: int = 3) -> None:
+        """Pre-fetch the segments covering `seconds` (video seek warms audio).
+
+        Runs on the pool's persistent worker (warm keep-alive connection), so
+        by the time the player asks for audio here it's already in RAM.
+        """
+        t = 0.0
+        for i, (_off, _size, dur) in enumerate(self.segs):
+            if t + dur > seconds:
+                for j in range(i, min(i + count, len(self.segs))):
+                    self._schedule(j)
+                return
+            t += dur
+
     def get(self, start: int, end: int) -> bytes | None:
         """Serve [start, end] if it is exactly the init section or one whole
         segment (the only ranges our generated playlists produce); None means
@@ -1814,7 +1828,14 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
             if remux and path.startswith("/vseg"):
                 m = re.match(r"/vseg(\d+)_(\d+)\.m4s$", path)
                 if m:
-                    data = remux.get_sub(int(m.group(1)), int(m.group(2)))
+                    si, sm = int(m.group(1)), int(m.group(2))
+                    ap = (prefetchers or {}).get("/a.mp4")
+                    if ap and si < len(remux.segments):
+                        # warm the audio for this position on its own pool -
+                        # otherwise a seek pays a cold proxy fetch for audio
+                        # AFTER the video buffer is already filled
+                        ap.warm_at(remux.segments[si][0] + sm * remux.SUB_S)
+                    data = remux.get_sub(si, sm)
                     if data is None:
                         self.send_error(404)
                         return
@@ -2077,7 +2098,9 @@ def main() -> int:
             "/v.m3u8": remux.video_playlist().decode(),
             "/a.m3u8": media_playlist("a.mp4", a_init, a_segs),
         }
-        prefetchers = {"/a.mp4": SegmentPrefetcher(a_up, a_init, a_segs, workers=1, ahead=4)}
+        # 2 workers: seek-warm audio fetches must not queue behind the
+        # sequential read-ahead on a single connection
+        prefetchers = {"/a.mp4": SegmentPrefetcher(a_up, a_init, a_segs, workers=2, ahead=4)}
         entry = "/master.m3u8"
         quality_note = (f"{enh_plan[1]}p enhanced (MetalFX native)" if enh_native else
                         f"{video.get('height')}p {(video.get('vcodec') or 'vp9').split('.')[0]} remux")
