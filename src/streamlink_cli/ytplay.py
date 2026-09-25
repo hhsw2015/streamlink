@@ -753,35 +753,95 @@ class VideoRemuxer:
     cleanly. Audio is a separate rendition served byte-range from the m4a sidx.
     """
 
-    HEAD_BYTES = 4 << 20      # enough to cover EBML+Info+Tracks+Cues+first cluster
-    WORKERS = 3               # gentle prefetch: must not starve the foreground fetch
-    AHEAD = 4                 # segments to prefetch past the last requested one
-    CACHE = 96               # remuxed segments kept in memory (LRU)
-    FETCH_CHUNK = 2 << 20    # foreground: split byte range across rotating-proxy exits
+    HEAD_BYTES = 512 << 10    # Cues sit at the file head (~7KB); grown if needed
+    HEAD_MAX = 8 << 20
+    WORKERS = 4               # background remux workers (fetch runs on chunk_pool)
+    AHEAD = 14                # deep lookahead: playback downloads ~3x realtime, so
+                              # the spare bandwidth builds a ~1min cushion - small
+                              # and medium seeks land inside it and cost nothing
+    CACHE_BYTES = 256 << 20  # remuxed segments kept in memory (LRU, byte-capped)
+    FETCH_CHUNK = 3 << 20    # split byte ranges across rotating-proxy exits
 
     def __init__(self, url: str, proxy: str | None, headers: dict | None, duration: float):
         from collections import OrderedDict
         import tempfile
         self._tmp = tempfile.mkdtemp(prefix="ytplay-vremux-")
         self.up = Upstream(url, proxy, headers)
-        self.total = self._total_size()
-        head = self.up.fetch_range(0, self.HEAD_BYTES - 1)
+        head, self.total = self._fetch_head()  # one request: head bytes + file size
         self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
+        while (not self.cues or self.first_cluster is None) and len(head) < self.HEAD_MAX:
+            head += self.up.fetch_range(len(head), min(len(head) * 2, self.HEAD_MAX) - 1)
+            self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
         if not self.cues or self.first_cluster is None:
             raise RuntimeError("webm Cues not found in head")
         self.header = head[:self.first_cluster]
         starts = [t for t, _ in self.cues]
         ends = starts[1:] + [max(duration, starts[-1] + 2.0) if duration else starts[-1] + 4.0]
         self.segments = [(starts[i], max(0.001, ends[i] - starts[i])) for i in range(len(starts))]
-        # canonical init + mp4 media timescale, from remuxing the first segment
-        init, m4s0 = self._remux(self._mini(0))
-        self.init_bytes = init
-        self.mp4_ts = self._mdhd_timescale(init)
         self.cache: "OrderedDict[int, bytes]" = OrderedDict()
-        self.cache[0] = self._patch(m4s0, self.segments[0][0])
+        self.cached_bytes = 0
         self.lock = threading.Lock()
         self.inflight: dict[int, threading.Event] = {}
+        self.started: set[int] = set()
+        self.gen = 0              # bumped on every foreground miss (seek signal);
+                                  # queued prefetch from an older gen bails unstarted
         self.pool = ThreadPoolExecutor(max_workers=self.WORKERS)
+        # Persistent chunk pool: Upstream connections are thread-local, so only
+        # long-lived threads keep warm keep-alive connections across seeks
+        # (fresh threads would pay the ~1s proxy TLS handshake per chunk). FIFO
+        # order doubles as priority: the awaited segment's chunks enqueue first.
+        # 12 workers ~ 3 segments x 4 chunks each downloading truly concurrently.
+        self.chunk_pool = ThreadPoolExecutor(max_workers=12)
+        # canonical init + mp4 timescale come from remuxing segment 0; run in the
+        # background so server startup overlaps the player launching
+        self.init_bytes = b""
+        self.mp4_ts = 16000
+        self._init_ready = threading.Event()
+        boot_ev = threading.Event()
+        self.inflight[0] = boot_ev
+        self.started.add(0)
+        threading.Thread(target=self._bootstrap, args=(boot_ev,), daemon=True).start()
+
+    def _bootstrap(self, ev: threading.Event):
+        try:
+            init, m4s0 = self._remux(self._mini(0))
+            self.init_bytes = init
+            self.mp4_ts = self._mdhd_timescale(init)
+            self._init_ready.set()
+            with self.lock:
+                self._store(0, self._patch(m4s0, self.segments[0][0]))
+        except Exception as err:  # noqa: BLE001 - background thread boundary
+            log("vremux bootstrap failed: " + repr(err))
+        finally:
+            self._init_ready.set()
+            with self.lock:
+                if self.inflight.get(0) is ev:
+                    self.inflight.pop(0)
+                self.started.discard(0)
+            ev.set()
+
+    def get_init(self) -> bytes | None:
+        self._init_ready.wait(timeout=90)
+        if not self.init_bytes:
+            try:  # bootstrap failed: one synchronous retry
+                init, _m4s0 = self._remux(self._mini(0))
+                self.init_bytes = init
+                self.mp4_ts = self._mdhd_timescale(init)
+            except Exception as err:  # noqa: BLE001 - reported to the player as 404
+                log("vremux init retry failed: " + repr(err))
+                return None
+        return self.init_bytes
+
+    def _store(self, i: int, data: bytes) -> None:
+        """Insert into the LRU under self.lock, evicting past the byte cap."""
+        old = self.cache.pop(i, None)
+        if old is not None:
+            self.cached_bytes -= len(old)
+        self.cache[i] = data
+        self.cached_bytes += len(data)
+        while self.cached_bytes > self.CACHE_BYTES and len(self.cache) > 1:
+            _k, v = self.cache.popitem(last=False)
+            self.cached_bytes -= len(v)
 
     # -- webm parsing -------------------------------------------------------- #
     @staticmethod
@@ -842,18 +902,27 @@ class VideoRemuxer:
             q = inner + xsz
         return seg_data, tcs, cues, first_cluster
 
-    def _total_size(self):
+    def _fetch_head(self) -> tuple[bytes, int]:
+        """Fetch the file head; its Content-Range also carries the total size."""
+        err: Exception | None = None
         for i in range(Upstream.RETRIES):
             try:
-                res = self.up.request("bytes=0-1"); res.read()
-                if getattr(res, "will_close", False): self.up._drop()
-                cr = res.headers.get("Content-Range")
-                if cr and "/" in cr:
-                    return int(cr.rsplit("/", 1)[1])
-            except (http.client.HTTPException, OSError):
-                pass
+                res = self.up.request(f"bytes=0-{self.HEAD_BYTES - 1}")
+                body = res.read()
+                if getattr(res, "will_close", False):
+                    self.up._drop()
+                if res.status < 400:
+                    cr = res.headers.get("Content-Range")
+                    if cr and "/" in cr:
+                        return body, int(cr.rsplit("/", 1)[1])
+                    err = RuntimeError("no Content-Range on head response")
+                else:
+                    err = UpstreamHTTPError(res.status)
+            except (http.client.HTTPException, OSError) as exc:
+                err = exc
             self.up._drop()
-        raise RuntimeError("could not determine webm size")
+            time.sleep(min(0.4, 0.1 * (i + 1)))
+        raise err or RuntimeError("could not fetch webm head")
 
     # -- remux --------------------------------------------------------------- #
     def _mini(self, i: int, parallel: bool = True) -> bytes:
@@ -862,12 +931,14 @@ class VideoRemuxer:
         body = self._fetch_parallel(a, b) if parallel else self.up.fetch_range(a, b)
         return self.header + body
 
+    HEDGE_S = 1.5             # chunk slower than this -> duplicate it to a new exit
+
     def _fetch_parallel(self, a: int, b: int) -> bytes:
-        # Foreground only: split one segment's byte range across parallel
-        # connections. The rotating proxy hands each connection its own exit, so
-        # chunks download over several exits at once - faster than one stream for
-        # the segment the player is waiting on. Prefetch stays single-connection
-        # so it never starves this foreground fetch.
+        # Split one segment's byte range across parallel chunks on the shared
+        # persistent pool: each worker thread keeps a warm keep-alive connection
+        # to its own rotating-proxy exit, so chunks download over several exits
+        # at once and no seek pays a fresh TLS handshake.
+        from concurrent.futures import FIRST_COMPLETED, TimeoutError as FutTimeout, wait
         total = b - a + 1
         if total <= self.FETCH_CHUNK:
             return self.up.fetch_range(a, b)
@@ -875,21 +946,33 @@ class VideoRemuxer:
         step = (total + n - 1) // n
         ranges = [(a + k * step, min(b, a + (k + 1) * step - 1)) for k in range(n)]
         ranges = [(s, e) for s, e in ranges if s <= e]
-        parts: list = [b""] * len(ranges)
-        errs: list = [None] * len(ranges)
-
-        def grab(k, s, e):
+        futures = [self.chunk_pool.submit(self.up.fetch_range, s, e) for s, e in ranges]
+        parts = []
+        for k, f in enumerate(futures):
             try:
-                parts[k] = self.up.fetch_range(s, e)
-            except Exception as exc:  # noqa: BLE001 - re-raised after join
-                errs[k] = exc
-
-        ths = [threading.Thread(target=grab, args=(k, s, e)) for k, (s, e) in enumerate(ranges)]
-        for t in ths: t.start()
-        for t in ths: t.join()
-        for exc in errs:
-            if exc:
-                raise exc
+                parts.append(f.result(timeout=self.HEDGE_S))
+                continue
+            except FutTimeout:
+                pass
+            # straggler: most exits finish a chunk well under HEDGE_S, so this
+            # one likely landed on a slow exit. Race a duplicate on a fresh
+            # connection (= fresh exit); first completed result wins. The loser
+            # is left to finish quietly (byte ranges are idempotent).
+            g = self.chunk_pool.submit(self.up.fetch_range, *ranges[k])
+            deadline = time.time() + 60
+            winner = None
+            while winner is None:
+                done, _ = wait({f, g}, timeout=5, return_when=FIRST_COMPLETED)
+                for h in done:
+                    if h.exception() is None:
+                        winner = h
+                        break
+                else:
+                    if len(done) == 2:  # both failed
+                        raise done.pop().exception() or RuntimeError("chunk fetch failed")
+                    if time.time() > deadline:
+                        raise TimeoutError("chunk fetch timed out (both attempts)")
+            parts.append(winner.result())
         return b"".join(parts)
 
     def _remux(self, mini: bytes):
@@ -957,24 +1040,31 @@ class VideoRemuxer:
                 self.cache.move_to_end(i); data = self.cache[i]
                 mine = None
             else:
+                # foreground miss = the player jumped here: bump the generation
+                # so queued prefetch for the OLD position bails instead of
+                # competing with this fetch for proxy bandwidth
+                self.gen += 1
                 ev = self.inflight.get(i)
                 if ev is None:
-                    ev = threading.Event(); self.inflight[i] = ev; mine = True
+                    ev = threading.Event(); self.inflight[i] = ev
+                    self.started.add(i); mine = True
+                elif i not in self.started:
+                    # queued prefetch that hasn't begun: claim it for the
+                    # foreground (parallel fetch) instead of waiting on a slot
+                    self.started.add(i); mine = True
                 else:
                     mine = False
         if mine is None:              # cache hit
             self._prefetch(i)         # (outside the lock: _prefetch takes it)
             return data
-        if not mine:
+        if not mine:                  # actively downloading in the background
             ev.wait(timeout=120)
             with self.lock:
                 return self.cache.get(i)
         try:
             data = self._produce(i)
             with self.lock:
-                self.cache[i] = data; self.cache.move_to_end(i)
-                while len(self.cache) > self.CACHE:
-                    self.cache.popitem(last=False)
+                self._store(i, data)
             self._prefetch(i)
             return data
         except (RuntimeError, http.client.HTTPException, OSError) as err:
@@ -982,29 +1072,48 @@ class VideoRemuxer:
             return None
         finally:
             with self.lock:
-                self.inflight.pop(i, None)
+                if self.inflight.get(i) is ev:
+                    self.inflight.pop(i)
+                self.started.discard(i)
             ev.set()
 
-    def _prefetch(self, i: int):
+    def _prefetch(self, i: int, hot: int = 2):
+        # After a seek the player buffers ~3 segments before resuming, so the
+        # first `hot` lookahead segments matter as much as the awaited one:
+        # fetch them parallel too (their chunks queue behind the foreground's
+        # on the shared FIFO pool). The rest stay gentle single-connection.
+        with self.lock:
+            gen = self.gen
         for j in range(i + 1, min(i + 1 + self.AHEAD, len(self.segments))):
             with self.lock:
                 if j in self.cache or j in self.inflight:
                     continue
                 ev = threading.Event(); self.inflight[j] = ev
-            self.pool.submit(self._bg, j, ev)
+            self.pool.submit(self._bg, j, ev, gen, j - i <= hot)
 
-    def _bg(self, j: int, ev: threading.Event):
+    def _bg(self, j: int, ev: threading.Event, gen: int, parallel: bool = False):
+        with self.lock:
+            if j in self.cache or j in self.started:
+                return  # foreground claimed it (or done): the owner cleans up
+            if gen != self.gen:
+                # stale queue entry (player seeked away): nobody will produce
+                # this - release the slot so a future request starts fresh
+                if self.inflight.get(j) is ev:
+                    self.inflight.pop(j)
+                ev.set()
+                return
+            self.started.add(j)
         try:
-            data = self._produce(j, parallel=False)  # gentle: don't starve foreground
+            data = self._produce(j, parallel=parallel)
             with self.lock:
-                self.cache[j] = data; self.cache.move_to_end(j)
-                while len(self.cache) > self.CACHE:
-                    self.cache.popitem(last=False)
+                self._store(j, data)
         except (RuntimeError, http.client.HTTPException, OSError):
             pass
         finally:
             with self.lock:
-                self.inflight.pop(j, None)
+                if self.inflight.get(j) is ev:
+                    self.inflight.pop(j)
+                self.started.discard(j)
             ev.set()
 
     def video_playlist(self) -> bytes:
@@ -1023,6 +1132,7 @@ class VideoRemuxer:
     def cleanup(self):
         import shutil
         self.pool.shutdown(wait=False, cancel_futures=True)
+        self.chunk_pool.shutdown(wait=False, cancel_futures=True)
         shutil.rmtree(self._tmp, ignore_errors=True)
 
 
@@ -1117,7 +1227,14 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
             # remux mode video rendition: shared fMP4 init + segments repackaged
             # on demand from the webm Cues (random access -> seek anywhere fast).
             if remux and path == "/vinit.mp4":
-                self._send_body(remux.init_bytes, "video/mp4")
+                init = remux.get_init()
+                if init is None:
+                    self.send_error(502)
+                    return
+                try:
+                    self._send_body(init, "video/mp4")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 return
             if remux and path.startswith("/vseg"):
                 m = re.match(r"/vseg(\d+)\.m4s$", path)
@@ -1126,7 +1243,10 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
                     if data is None:
                         self.send_error(404)
                         return
-                    self._send_body(data, "video/mp4")
+                    try:
+                        self._send_body(data, "video/mp4")
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass  # player cancelled (normal during seeks)
                     return
 
             if path == "/hls.m3u8" and hls and "u" in params:
@@ -1292,9 +1412,13 @@ def main() -> int:
             f"{video.get('vcodec')} + {audio.get('format_id')} -> fMP4 random-access")
         a_up = Upstream(audio["url"], proxy, audio.get("http_headers"))
         try:
-            remux = VideoRemuxer(video["url"], proxy, video.get("http_headers"),
-                                 duration=info.get("duration") or 0)
-            a_init, a_segs = parse_sidx(a_up)
+            with ThreadPoolExecutor(max_workers=2) as pool:  # video head ∥ audio sidx
+                r_future = pool.submit(VideoRemuxer, video["url"], proxy,
+                                       video.get("http_headers"),
+                                       info.get("duration") or 0)
+                a_future = pool.submit(parse_sidx, a_up)
+                remux = r_future.result(timeout=90)
+                a_init, a_segs = a_future.result(timeout=90)
         except Exception as err:
             log("remux setup failed: " + repr(err))
             notify_mac("ytplay failed", "remux setup: " + str(err)[:80])
@@ -1330,7 +1454,6 @@ def main() -> int:
                 log(f"sidx parse failed ({time.time() - t0:.1f}s): "
                     + repr(err) + " -> cache mode")
                 info["mode"] = "cache-fallback"
-                media = video
         if info["mode"] == "cache-fallback":
             # yt-dlp downloads both DASH streams to local files; serve byte-range
             # HLS from the growing files (full seek + edge play, no transcode).
@@ -1411,13 +1534,21 @@ def main() -> int:
             f"{media.get('width')}x{media.get('height')} .{media.get('ext')}")
         up = Upstream(media["url"], proxy, media.get("http_headers"))
         # probe: IP-signed URLs die when the proxy exit rotates between
-        # extract and fetch -> fall back to yt-dlp-managed cache download
-        try:
-            probe = up.request("bytes=0-0")
-            probe.read()
-            probe_status = probe.status
-        except Exception:
-            probe_status = 599
+        # extract and fetch -> fall back to yt-dlp-managed cache download.
+        # Retried: a single 403 may just be one bad rotating exit (~1 in 10),
+        # and cache mode is expensive (full download), so don't fall in early.
+        probe_status = 599
+        for _ in range(3):
+            try:
+                probe = up.request("bytes=0-0")
+                probe.read()
+                probe_status = probe.status
+            except Exception:
+                probe_status = 599
+            if probe_status < 400:
+                break
+            up._drop()
+            time.sleep(0.2)
         if probe_status < 400:
             upstreams = {"/media": up}
             entry = "/media"
