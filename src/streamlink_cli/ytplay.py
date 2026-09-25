@@ -282,6 +282,13 @@ def _run_ytdlp(url: str, quality: str, proxy: str | None, cookies: str | None,
            "-f", fmt or format_selector(quality, enhance), url]
     if proxy:
         cmd += ["--proxy", proxy]
+    if enhance:
+        # Some sites (PornHub) serve the HLS variant behind a manifest that
+        # 4xx's per rotating-proxy exit; without retries yt-dlp silently drops
+        # the m3u8 formats and returns only progressive (no native enhance).
+        # Each extractor retry rides a fresh exit, so a handful reliably lands
+        # the HLS manifest.
+        cmd += ["--extractor-retries", "12", "--retries", "12"]
     cmd += _cookie_args(cookies)
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if res.returncode != 0:
@@ -315,16 +322,38 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
     use_direct = _direct_reachable(url) if proxy else True
     primary = None if use_direct else proxy
     log("extracting streams (" + ("direct" if use_direct else "proxy") + ")...")
+
+    def _extract(px):
+        return _run_ytdlp(url, quality, px, cookies, timeout=180, enhance=enhance)
+
+    def _has_hls(d) -> bool:
+        fmts = d.get("requested_formats") or [d]
+        return any("m3u8" in (f.get("protocol") or "") for f in fmts)
+
     try:
-        data = _run_ytdlp(url, quality, primary, cookies, timeout=120, enhance=enhance)
+        data = _extract(primary)
         used_proxy = primary
     except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as err:
         if use_direct and proxy:
             log("direct failed (" + str(err)[:120] + "), retrying via proxy...")
-            data = _run_ytdlp(url, quality, proxy, cookies, timeout=180, enhance=enhance)
+            data = _extract(proxy)
             used_proxy = proxy
         else:
             raise
+    # Enhance wants the HLS variant (native per-segment path). Sites like PH
+    # intermittently drop their m3u8 manifest per rotating-proxy exit, leaving
+    # only progressive. Re-extract (fresh exits) a few times to land HLS before
+    # settling for the progressive fallback (which can't use the native tier).
+    if enhance and not _has_hls(data):
+        for k in range(6):
+            log(f"enhance: no HLS variant yet, re-extracting ({k + 1}/6)...")
+            try:
+                d2 = _extract(used_proxy or proxy)
+                if _has_hls(d2):
+                    data = d2
+                    break
+            except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError):
+                pass
 
     fmts = data.get("requested_formats")
     info = {"title": data.get("title") or "video", "duration": data.get("duration") or 0,
