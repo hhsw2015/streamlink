@@ -243,9 +243,9 @@ def _cookie_args(cookies: str | None) -> list[str]:
 
 
 def _run_ytdlp(url: str, quality: str, proxy: str | None, cookies: str | None,
-               timeout: int) -> dict:
+               timeout: int, fmt: str | None = None) -> dict:
     cmd = ["yt-dlp", "--no-update", "--no-playlist", "--dump-json",
-           "-f", format_selector(quality), url]
+           "-f", fmt or format_selector(quality), url]
     if proxy:
         cmd += ["--proxy", proxy]
     cmd += _cookie_args(cookies)
@@ -805,10 +805,16 @@ class VideoRemuxer:
     CACHE_BYTES = 256 << 20  # remuxed segments kept in memory (LRU, byte-capped)
     FETCH_CHUNK = 3 << 20    # split byte ranges across rotating-proxy exits
 
-    def __init__(self, url: str, proxy: str | None, headers: dict | None, duration: float):
+    def __init__(self, url: str, proxy: str | None, headers: dict | None, duration: float,
+                 enhance: tuple[int, int, str] | None = None):
         from collections import OrderedDict
         import tempfile
         self._tmp = tempfile.mkdtemp(prefix="ytplay-vremux-")
+        # enhance = (out_w, out_h, shader_path): each segment is GPU-upscaled
+        # (libplacebo) instead of -c copy remuxed. Random access + prefetch +
+        # seek all come free from this class, so enhanced playback seeks like
+        # raw does (per-segment on demand) instead of a sequential transcode.
+        self.enhance = enhance
         self.up = Upstream(url, proxy, headers)
         head, self.total = self._fetch_head()  # one request: head bytes + file size
         self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
@@ -1024,13 +1030,29 @@ class VideoRemuxer:
         src = os.path.join(d, "in.webm")
         with open(src, "wb") as f:
             f.write(mini)
-        # -c copy, no -copyts: timestamps reset to 0 so the init is identical for
-        # every segment (shared EXT-X-MAP); we position each via a patched tfdt.
-        cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", src,
-               "-c", "copy", "-f", "hls", "-hls_time", "99999",
-               "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4",
-               "-hls_segment_filename", os.path.join(d, "s%03d.m4s"),
-               os.path.join(d, "i.m3u8")]
+        # No -copyts: timestamps reset to 0 so the init is identical for every
+        # segment (shared EXT-X-MAP); we position each via a patched tfdt.
+        if self.enhance:
+            # GPU upscale this segment (VideoToolbox decode -> Metal shader ->
+            # VideoToolbox HEVC encode). Per-segment, so seeking anywhere only
+            # enhances the segments actually requested.
+            ow, oh, shader = self.enhance
+            mbit = 25 if oh >= 2000 else 16 if oh >= 1400 else 10
+            cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
+                   "-hwaccel", "videotoolbox", "-i", src,
+                   "-vf", f"libplacebo=w={ow}:h={oh}:upscaler=ewa_lanczos:custom_shader_path={shader}",
+                   "-c:v", "hevc_videotoolbox", "-b:v", f"{mbit}M", "-realtime", "1",
+                   "-tag:v", "hvc1", "-an",
+                   "-f", "hls", "-hls_time", "99999", "-hls_segment_type", "fmp4",
+                   "-hls_fmp4_init_filename", "init.mp4",
+                   "-hls_segment_filename", os.path.join(d, "s%03d.m4s"),
+                   os.path.join(d, "i.m3u8")]
+        else:
+            cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", src,
+                   "-c", "copy", "-f", "hls", "-hls_time", "99999",
+                   "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4",
+                   "-hls_segment_filename", os.path.join(d, "s%03d.m4s"),
+                   os.path.join(d, "i.m3u8")]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         init_p = os.path.join(d, "init.mp4")
         segs = sorted(f for f in os.listdir(d) if f.endswith(".m4s"))
@@ -1600,10 +1622,11 @@ def main() -> int:
     last_activity = {"t": time.time()}
     enh_holder: dict = {}
 
-    # Enhance mode is a self-contained path: yt-dlp -> ffmpeg (GPU upscale) ->
-    # growing fMP4-HLS. It supersedes the sidx/remux/cache dispatch (which would
-    # only double-fetch and fight for bandwidth). Edge-play holds (ffmpeg emits
-    # segments as it transcodes); only random seek degrades to sequential.
+    # Enhance mode: per-segment GPU upscale with the SAME random-access engine as
+    # remux (VideoRemuxer + enhance filter), so seeking anywhere only enhances the
+    # requested segments - no sequential-transcode buffering. Video is webm/vp9
+    # (Cues give random access); audio is a separate m4a-sidx rendition. Falls
+    # back to the sequential EnhancePipe when the source has no webm/Cues.
     vsrc = info.get("video") or info.get("media") or {}
     enh_shader = _shader_path(ENHANCE_SHADER) if args.enhance else None
     enh_plan = (enhance_plan(int(vsrc.get("width") or 0), int(vsrc.get("height") or 0),
@@ -1617,6 +1640,10 @@ def main() -> int:
         ow, oh = enh_plan
         fpsv = vsrc.get("fps") or 30
         log(f"mode=enhance {vsrc.get('width')}x{vsrc.get('height')}@{fpsv} -> {ow}x{oh} CuNNy")
+        # Sequential transcode: smooth playback (~1.8x realtime), forward seek
+        # past the transcode waits. Per-segment random-access enhance was tried
+        # and rejected - ffmpeg's per-spawn Vulkan init makes it too slow to keep
+        # playback fed. Smooth + seekable + enhanced needs the native Metal tier.
         pipe = EnhancePipe(args.url, args.quality, proxy, cookies_arg, ow, oh, enh_shader,
                            duration=info.get("duration") or 0)
         if pipe.wait_ready():
@@ -1624,9 +1651,9 @@ def main() -> int:
             entry = "/enh/index.m3u8"
             quality_note = f"{oh}p enhanced (CuNNy)"
         else:
-            log("enhance: ffmpeg produced no output -> falling back to raw sidx")
+            log("enhance: ffmpeg produced no output -> raw dispatch")
             pipe.cleanup()
-            enh_plan = None  # fall through to normal dispatch
+            enh_plan = None
 
     if enh_plan is not None:
         pass  # enhance path set entry above; skip source-mode dispatch
