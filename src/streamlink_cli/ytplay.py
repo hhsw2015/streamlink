@@ -934,6 +934,18 @@ class VideoRemuxer:
         # source-agnostic, so any source that provides fMP4 segments gets the
         # full native path - "use native whenever the format allows".
         self._build_index(duration)
+        # Frame interpolation ~halves GPU throughput. On coarse segments (e.g.
+        # PornHub's 8.5s TS) the per-segment enhance then can't stay ahead of
+        # playback and it stutters. Keep 60fps only when segments are small
+        # enough to sustain it; otherwise fall back to a smooth 4K30.
+        if self.enhance and "fps2x" in self.enhance[2] and self.segments:
+            import statistics
+            med = statistics.median(d for _, d in self.segments)
+            if med > 4.0:
+                ow, oh, ms = self.enhance
+                self.enhance = (ow, oh, ms.replace(":fps2x", ""))
+                log(f"enhance: {med:.1f}s segments too coarse for 60fps interp "
+                    f"-> smooth 4K30")
         self.cache: "OrderedDict[int, bytes]" = OrderedDict()
         self.cached_bytes = 0
         self.lock = threading.Lock()
@@ -1623,7 +1635,16 @@ class VideoRemuxer:
         # on the shared FIFO pool). The rest stay gentle single-connection.
         with self.lock:
             gen = self.gen
-        ahead = 4 if self.enhance else self.AHEAD  # each enhanced seg costs GPU
+        if self.enhance:
+            # GPU is only ~1.3x realtime, so a deep enhance backlog starves the
+            # segment the player needs next. Keep ~one segment's lead: with big
+            # segments (PH ~8.5s) that's ahead=1; with small ones (~2s) allow a
+            # few so the pipeline stays full. hot (parallel download) tracks it.
+            seg_dur = self.segments[i][1] if i < len(self.segments) else 2.0
+            ahead = max(1, min(4, int(8.0 / max(seg_dur, 1.0))))
+            hot = 1
+        else:
+            ahead = self.AHEAD
         for j in range(i + 1, min(i + 1 + ahead, len(self.segments))):
             with self.lock:
                 if j in self.cache or j in self.inflight:
