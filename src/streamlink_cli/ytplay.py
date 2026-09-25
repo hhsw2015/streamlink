@@ -401,25 +401,58 @@ class Upstream:
                 pass
             self._local.conn = None
 
+    def _retarget(self, location: str):
+        """Follow a redirect: repoint this Upstream (all threads) at the new URL.
+
+        googlevideo 302s across cache nodes; the move is durable, so updating
+        the shared target is right - other threads' pooled connections to the
+        old host get redirected too on their next request and land here.
+        """
+        new = urllib.parse.urljoin(self.url, location)
+        parsed = urllib.parse.urlsplit(new)
+        self.url = new
+        self.host = parsed.hostname or self.host
+        self.port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        self.path = parsed.path + ("?" + parsed.query if parsed.query else "")
+        self.tls = parsed.scheme == "https"
+        self._drop()  # this thread reconnects to the new host
+        log(f"upstream redirect -> {self.host}")
+
     def request(self, rng: str | None) -> http.client.HTTPResponse:
         """Single request on the pooled (or fresh) connection. Retries once on
-        a stale keep-alive socket; does NOT retry HTTP error statuses."""
+        a stale keep-alive socket and follows redirects (302 body is empty -
+        treating it as success is how segments turn into 0-byte reads);
+        does NOT retry HTTP error statuses."""
         headers = dict(self.headers)
         if rng:
             headers["Range"] = rng
-        for attempt in (1, 2):
+        stale = 0
+        redirects = 0
+        while True:
             conn = getattr(self._local, "conn", None)
             if conn is None:
                 conn = self._connect()
                 self._local.conn = conn
             try:
                 conn.request("GET", self.path, headers=headers)
-                return conn.getresponse()
+                res = conn.getresponse()
             except (http.client.HTTPException, OSError):
                 self._drop()
-                if attempt == 2:
+                stale += 1
+                if stale > 1:
                     raise
-        raise RuntimeError("unreachable")
+                continue
+            if res.status in (301, 302, 303, 307, 308) and redirects < 3:
+                loc = res.headers.get("Location")
+                if loc:
+                    try:
+                        res.read()  # drain before switching targets
+                    except (http.client.HTTPException, OSError):
+                        pass
+                    self._retarget(loc)
+                    redirects += 1
+                    continue
+            return res
 
     def fetch_range(self, start: int, end: int) -> bytes:
         rng = f"bytes={start}-{end}"
@@ -441,7 +474,8 @@ class Upstream:
                     expect = (int(m.group(2)) - int(m.group(1)) + 1) if m else want
                     if len(body) == expect:
                         return body
-                    err = RuntimeError(f"short read {len(body)}/{expect}")
+                    err = RuntimeError(
+                        f"short read {len(body)}/{expect} (HTTP {res.status}, CR={cr!r})")
                 else:
                     err = UpstreamHTTPError(res.status)
             except (http.client.HTTPException, OSError) as exc:
