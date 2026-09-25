@@ -146,6 +146,49 @@ def _remux_tier(quality: str) -> bool:
     return _height_ceiling(quality) > 1080 and _hw_decode_tier() == "vp9"
 
 
+# --------------------------------------------------------------------------- #
+# GPU enhance planning (AI upscale via libplacebo shaders)
+# --------------------------------------------------------------------------- #
+
+# Sustained CuNNy throughput on this class of GPU, measured on M2 Pro (19-core):
+# 1080p30 -> 4K held 1.44x realtime = ~358 Mpx/s; use a conservative figure so
+# the auto-planner keeps a safety margin and never lets the enhancer fall behind
+# playback (which would stutter). Tune per machine if needed.
+ENHANCE_MPX_PER_S = 300_000_000
+ENHANCE_SHADER = "CuNNy-4x12-DS.glsl"      # quality-tier CNN luma upscaler
+
+
+def _shader_path(name: str) -> str | None:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for c in (os.path.join(here, "..", "..", "contrib", "enhance-shaders", name),
+              os.path.expanduser("~/.config/mpv/shaders/" + name)):
+        if os.path.exists(c):
+            return os.path.abspath(c)
+    return None
+
+
+def enhance_plan(width: int, height: int, fps: float, mode: str) -> tuple[int, int] | None:
+    """Pick the largest output that keeps the CNN enhancer ahead of playback.
+
+    "auto"/"cunny": scale toward 2x, but cap output pixels to the per-frame
+    budget (throughput / fps) so a 60fps source lands at ~3K instead of a 4K it
+    can't sustain, while a 24-30fps source gets full 4K. Returns (w, h) rounded
+    to even, or None to pass through unenhanced (source already high, or the
+    budget only allows a trivial <1.2x upscale that isn't worth a transcode).
+    """
+    if mode in ("", "off") or not width or not height:
+        return None
+    if height >= 1440:                     # already high; enhancing it blows the budget
+        return None
+    fps = fps or 30.0
+    src_px = width * height
+    budget_px = ENHANCE_MPX_PER_S / max(fps, 1.0)
+    scale = min(2.0, (budget_px / src_px) ** 0.5)
+    if scale < 1.2:
+        return None
+    return (int(width * scale) // 2 * 2, int(height * scale) // 2 * 2)
+
+
 def format_selector(quality: str) -> str:
     height = _height_ceiling(quality)
     h = f"[height<={height}]"
@@ -1136,6 +1179,141 @@ class VideoRemuxer:
         shutil.rmtree(self._tmp, ignore_errors=True)
 
 
+class EnhancePipe:
+    """GPU AI-upscale stage in front of the player.
+
+    yt-dlp streams the source video + audio through FIFOs into ffmpeg (yt-dlp
+    handles proxy/cookies/403 for any site); ffmpeg runs a CNN luma upscaler on
+    the GPU via libplacebo (VideoToolbox decode -> Metal shader -> VideoToolbox
+    HEVC encode, all hardware) and emits a fresh fMP4-HLS the player consumes.
+    Self-contained (does not read our byte-range relay, whose custom ranges
+    ffmpeg's HLS client can't follow). Transcode is sequential: playback and
+    edge-play stay smooth (it runs faster than realtime by design - see
+    enhance_plan), but a large forward seek waits for the transcode to reach it.
+    """
+
+    SEG = 2.0  # forced-keyframe interval = HLS segment seconds (predictable)
+
+    def __init__(self, url: str, quality: str, proxy: str | None, cookies: str | None,
+                 out_w: int, out_h: int, shader: str, duration: float = 0):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="ytplay-enh-")
+        self.m3u8 = os.path.join(self.dir, "index.m3u8")  # ffmpeg's own (unused)
+        self.done = False
+        self.playlist = self._build_playlist(duration)
+        # Two FIFOs stream video + audio LIVE into ffmpeg. (Merging to a single
+        # stdout via yt-dlp does NOT stream - it downloads both fully then muxes,
+        # starving ffmpeg.) FIFOs carry an extension so ffmpeg picks the demuxer.
+        # Prefer webm video: it streams through a pipe (mp4 needs to seek for its
+        # moov) and vp9 hardware-decodes; av01 would software-decode and stall.
+        self.vfifo = os.path.join(self.dir, "v.webm")
+        self.afifo = os.path.join(self.dir, "a.m4a")
+        os.mkfifo(self.vfifo)
+        os.mkfifo(self.afifo)
+        h = _height_ceiling(quality)
+        vsel = f"bv*[height<={h}][ext=webm]/bv*[height<={h}][vcodec^=vp9]/bv*[height<={h}]"
+        asel = "ba[ext=m4a]/ba[acodec^=mp4a]/ba"
+        self.yv = self._ytdlp(url, vsel, proxy, cookies, self.vfifo)
+        self.ya = self._ytdlp(url, asel, proxy, cookies, self.afifo)
+        mbit = 25 if out_h >= 2000 else 16 if out_h >= 1400 else 10
+        vf = f"libplacebo=w={out_w}:h={out_h}:upscaler=ewa_lanczos:custom_shader_path={shader}"
+        fcmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
+                "-hwaccel", "videotoolbox", "-i", self.vfifo, "-i", self.afifo,
+                "-map", "0:v:0", "-map", "1:a:0", "-vf", vf,
+                "-c:v", "hevc_videotoolbox", "-b:v", f"{mbit}M", "-realtime", "1",
+                # exact SEG-second GOP so segments are uniform & keyframe-aligned:
+                # lets us publish a complete VOD playlist upfront (seek bar) and
+                # keeps every seek landing clean (re-encode, so keyframes are real)
+                "-force_key_frames", f"expr:gte(t,n_forced*{self.SEG})",
+                "-tag:v", "hvc1", "-c:a", "aac", "-b:a", "192k",
+                "-f", "hls", "-hls_time", str(self.SEG), "-hls_playlist_type", "vod",
+                "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4",
+                "-hls_segment_filename", os.path.join(self.dir, "seg%05d.m4s"),
+                self.m3u8]
+        self.proc = subprocess.Popen(fcmd, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        threading.Thread(target=self._wait, daemon=True).start()
+
+    def _build_playlist(self, duration: float) -> bytes:
+        import math
+        n = max(1, math.ceil(duration / self.SEG)) if duration > 0 else 1
+        lines = ["#EXTM3U", "#EXT-X-VERSION:7",
+                 f"#EXT-X-TARGETDURATION:{int(self.SEG) + 1}",
+                 "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD",
+                 '#EXT-X-MAP:URI="init.mp4"']
+        remaining = duration or self.SEG
+        for i in range(n):
+            dur = self.SEG if remaining >= self.SEG or i < n - 1 else max(0.001, remaining)
+            lines.append(f"#EXTINF:{dur:.3f},")
+            lines.append(f"seg{i:05d}.m4s")
+            remaining -= self.SEG
+        lines.append("#EXT-X-ENDLIST")
+        return ("\n".join(lines) + "\n").encode()
+
+    @staticmethod
+    def _ytdlp(url, fmt, proxy, cookies, out) -> subprocess.Popen:
+        cmd = ["yt-dlp", "--no-update", "--no-playlist", "--quiet", "--no-part",
+               "-f", fmt, "-o", out, url]
+        if proxy:
+            cmd += ["--proxy", proxy]
+        cmd += _cookie_args(cookies)
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _wait(self):
+        self.proc.wait()
+        self.done = True
+        for p in (self.yv, self.ya):
+            if p.poll() is None:
+                p.terminate()
+        log(f"enhance done (rc={self.proc.returncode})")
+
+    def wait_ready(self, timeout: float = 90.0) -> bool:
+        # -hls_playlist_type vod defers ffmpeg's own index.m3u8 to the end, but
+        # segments + init stream out as they encode - wait on those (we serve a
+        # synthetic VOD playlist, not ffmpeg's).
+        deadline = time.time() + timeout
+        init = os.path.join(self.dir, "init.mp4")
+        seg0 = os.path.join(self.dir, "seg00000.m4s")
+        while time.time() < deadline:
+            if os.path.exists(init) and os.path.exists(seg0):
+                return True
+            if self.done:
+                return os.path.exists(seg0)
+            time.sleep(0.2)
+        return False
+
+    def read(self, name: str, last_activity: dict | None = None,
+             timeout: float = 600.0) -> bytes | None:
+        # Complete VOD playlist served upfront (full seek bar); init + segments
+        # served from disk, blocking on a not-yet-transcoded segment (a forward
+        # seek ahead of the sequential transcode) until it lands or ffmpeg ends.
+        if name.endswith(".m3u8"):
+            return self.playlist
+        path = os.path.join(self.dir, os.path.basename(name))
+        if os.path.dirname(os.path.abspath(path)) != os.path.abspath(self.dir):
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        return f.read()
+                except OSError:
+                    return None
+            if self.done:
+                return None
+            if last_activity is not None:
+                last_activity["t"] = time.time()
+            time.sleep(0.2)
+        return None
+
+    def cleanup(self):
+        import shutil
+        for p in (getattr(self, "yv", None), getattr(self, "ya", None), self.proc):
+            if p is not None and p.poll() is None:
+                p.terminate()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
 
 class LocalGrowingFile:
     """Serve byte ranges from a file yt-dlp is still writing. Same get()/total
@@ -1178,7 +1356,8 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
                  hls: HlsFetcher | None, last_activity: dict,
                  cache: CacheDownload | None = None,
                  prefetchers: dict[str, "SegmentPrefetcher"] | None = None,
-                 remux: "VideoRemuxer | None" = None):
+                 remux: "VideoRemuxer | None" = None,
+                 enh_holder: dict | None = None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -1222,6 +1401,21 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
             playlist = playlists.get(path)
             if playlist is not None:
                 self._send_body(playlist.encode(), "application/vnd.apple.mpegurl")
+                return
+
+            # enhance mode: serve ffmpeg's growing enhanced HLS from its temp dir.
+            enh = (enh_holder or {}).get("pipe")
+            if enh and path.startswith("/enh/"):
+                body = enh.read(os.path.basename(path), last_activity)
+                if body is None:
+                    self.send_error(404)
+                    return
+                ctype = ("application/vnd.apple.mpegurl" if path.endswith(".m3u8")
+                         else "video/mp4")
+                try:
+                    self._send_body(body, ctype)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 return
 
             # remux mode video rendition: shared fMP4 init + segments repackaged
@@ -1373,6 +1567,9 @@ def main() -> int:
                         help="let yt-dlp read cookies from a browser profile (chrome/safari/...)")
     parser.add_argument("--idle-timeout", type=int, default=0,
                         help="exit N seconds after the last request (0 = run until killed)")
+    parser.add_argument("--enhance", default="", metavar="MODE",
+                        help="GPU AI upscale: auto|cunny (smart CNN, framerate-safe res). "
+                             "Empty = off.")
     args = parser.parse_args()
 
     proxy = args.proxy if args.proxy else detect_proxy()
@@ -1401,8 +1598,39 @@ def main() -> int:
     remux: VideoRemuxer | None = None
     prefetchers: dict[str, SegmentPrefetcher] = {}
     last_activity = {"t": time.time()}
+    enh_holder: dict = {}
 
-    if info["mode"] == "remux":
+    # Enhance mode is a self-contained path: yt-dlp -> ffmpeg (GPU upscale) ->
+    # growing fMP4-HLS. It supersedes the sidx/remux/cache dispatch (which would
+    # only double-fetch and fight for bandwidth). Edge-play holds (ffmpeg emits
+    # segments as it transcodes); only random seek degrades to sequential.
+    vsrc = info.get("video") or info.get("media") or {}
+    enh_shader = _shader_path(ENHANCE_SHADER) if args.enhance else None
+    enh_plan = (enhance_plan(int(vsrc.get("width") or 0), int(vsrc.get("height") or 0),
+                             float(vsrc.get("fps") or 30), args.enhance)
+                if enh_shader else None)
+    if args.enhance and enh_plan is None:
+        log(f"enhance: source {vsrc.get('width')}x{vsrc.get('height')} not upscaled "
+            f"({'no shader' if not enh_shader else 'already high / not worth it'}); raw mode")
+
+    if enh_plan is not None:
+        ow, oh = enh_plan
+        fpsv = vsrc.get("fps") or 30
+        log(f"mode=enhance {vsrc.get('width')}x{vsrc.get('height')}@{fpsv} -> {ow}x{oh} CuNNy")
+        pipe = EnhancePipe(args.url, args.quality, proxy, cookies_arg, ow, oh, enh_shader,
+                           duration=info.get("duration") or 0)
+        if pipe.wait_ready():
+            enh_holder["pipe"] = pipe
+            entry = "/enh/index.m3u8"
+            quality_note = f"{oh}p enhanced (CuNNy)"
+        else:
+            log("enhance: ffmpeg produced no output -> falling back to raw sidx")
+            pipe.cleanup()
+            enh_plan = None  # fall through to normal dispatch
+
+    if enh_plan is not None:
+        pass  # enhance path set entry above; skip source-mode dispatch
+    elif info["mode"] == "remux":
         # vp9 webm -> fMP4 (M1/M2 >1080p): video is repackaged on demand from the
         # webm Cues index (random access -> seek anywhere in ~1 fetch); audio is a
         # separate rendition served byte-range from the m4a sidx, exactly like sidx
@@ -1585,9 +1813,12 @@ def main() -> int:
     log(f"ready in {time.time() - t0:.1f}s")
 
     handler = make_handler(playlists, upstreams, hls_fetcher, last_activity, cache,
-                           prefetchers, remux)
+                           prefetchers, remux, enh_holder)
     srv = RelayServer(("127.0.0.1", args.port), handler)
-    local_url = f"http://127.0.0.1:{srv.server_address[1]}" + entry
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    local_url = f"http://127.0.0.1:{port}" + entry
     log("serving " + local_url)
     notify_mac("ytplay", quality_note + " ready, launching player")
 
@@ -1600,25 +1831,32 @@ def main() -> int:
             title += "." + info["media"]["ext"]
         launch_player(args.player, local_url, title)
 
+    stop = threading.Event()
     if args.idle_timeout:
         def reaper():
-            while True:
+            while not stop.is_set():
                 time.sleep(5)
                 if time.time() - last_activity["t"] > args.idle_timeout:
                     log("idle timeout, exiting")
-                    srv.shutdown()
+                    stop.set()
                     return
         threading.Thread(target=reaper, daemon=True).start()
 
+    # serve_forever runs on a daemon thread (started at bind); park here.
     try:
-        srv.serve_forever()
+        while not stop.wait(0.5):
+            pass
     except KeyboardInterrupt:
         pass
     finally:
+        srv.shutdown()
         if cache is not None:
             cache.cleanup()
         if remux is not None:
             remux.cleanup()
+        pipe = enh_holder.get("pipe")
+        if pipe is not None:
+            pipe.cleanup()
     return 0
 
 

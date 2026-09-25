@@ -83,15 +83,19 @@ def write_cookies_file(cookies: list) -> str | None:
     return path
 
 
-def launch_ytplay(url: str, quality: str, scheme: str, cookies: list) -> int:
+def launch_ytplay(url: str, quality: str, scheme: str, cookies: list,
+                  enhance: str = "") -> int:
     child_log = open(CHILD_LOG, "a")
     child_log.write(
         "\n===== " + _dt.datetime.now().isoformat(timespec="seconds")
         + " [ytplay] url=" + url + " quality=" + quality
-        + " cookies=" + str(len(cookies)) + " =====\n",
+        + " cookies=" + str(len(cookies))
+        + ((" enhance=" + enhance) if enhance else "") + " =====\n",
     )
     child_log.flush()
     cmd = [STREAMLINK_YTPLAY, url, quality, "--idle-timeout", "300"]
+    if enhance:
+        cmd += ["--enhance", enhance]
     if scheme:
         cmd += ["--player", scheme]
     cookies_file = write_cookies_file(cookies)
@@ -189,7 +193,8 @@ def main() -> int:
                     player_arg = scheme      # raw template - ytplay substitutes $edurl etc.
             else:
                 player_arg = "iina" if player.lower() == "iina" else "senplayer"
-            pid = launch_ytplay(url, quality, player_arg, msg.get("cookies") or [])
+            pid = launch_ytplay(url, quality, player_arg, msg.get("cookies") or [],
+                                enhance=str(msg.get("enhance", "") or ""))
             log("launched streamlink-ytplay pid=" + str(pid) + " player=" + player_arg)
             write_message({"ok": True, "pid": pid, "log": CHILD_LOG})
             return 0

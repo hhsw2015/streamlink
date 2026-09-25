@@ -50,6 +50,31 @@ async function rebuildMenus() {
       });
     }
   }
+  // Enhance selector: GPU AI upscale in the local pipeline before the stream
+  // reaches the player. Any yt-dlp site. Two backends, each best in its niche
+  // on Apple Silicon (measured): MetalFX guarantees 4K60; CuNNy is the quality
+  // ceiling but auto-caps resolution to stay realtime.
+  const { enhanceMode } = await chrome.storage.local.get({ enhanceMode: "off" });
+  chrome.contextMenus.create({
+    id: "sl-enhance-menu",
+    title: "✨ 画质增强",
+    contexts: ["link", "page", "video", "selection"],
+  });
+  const ENH = [
+    ["off", "关闭"],
+    ["quality", "质量优先 (AI 超分, 画质最佳)"],
+    ["speed", "速度优先 (4K60, 最流畅)"],
+  ];
+  for (const [mode, label] of ENH) {
+    chrome.contextMenus.create({
+      id: `sl-enhance-${mode}`,
+      parentId: "sl-enhance-menu",
+      title: label,
+      type: "radio",
+      checked: enhanceMode === mode,
+      contexts: ["link", "page", "video", "selection"],
+    });
+  }
   // Legacy tree (streamlink-redirect + cloud extractor + savenow) removed:
   // savenow stopped granting free credit, so that chain dead-ends at
   // "Balance insufficient". ytplay (yt-dlp pipeline) is the only path now.
@@ -65,6 +90,15 @@ chrome.runtime.onStartup.addListener(async () => {
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  // Enhance mode: persists in storage, applied to every subsequent play.
+  const enhMatch = String(info.menuItemId).match(/^sl-enhance-(.+)$/);
+  if (enhMatch && enhMatch[1] !== "menu") {
+    const mode = enhMatch[1];
+    await chrome.storage.local.set({ enhanceMode: mode });
+    notify("画质增强: " + (mode === "off" ? "已关闭" : mode + " 已开启 ✨"), "Local");
+    return;
+  }
+
   const url = info.linkUrl || info.srcUrl || info.pageUrl || (tab && tab.url);
   if (!url) return notify("no URL to open");
 
@@ -75,7 +109,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const playerId = ytMatch[1];
     const quality = ytMatch[2];
     const player = PLAYERS.find((p) => p.id === playerId);
-    notify(player.name + " " + quality + " → resolving (ytplay)", "Local");
+    const { enhanceMode } = await chrome.storage.local.get({ enhanceMode: "off" });
+    const enhance = enhanceMode !== "off" ? enhanceMode : "";
+    notify(player.name + " " + quality + (enhance ? " ✨" + enhance : "") + " → resolving (ytplay)", "Local");
     const cookies = await collectCookies(url);
     const payload = {
       engine: "ytplay",
@@ -83,6 +119,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       quality,
       scheme: playerId,   // ytplay knows senplayer/iina by name
       cookies,
+      enhance,            // "" | "2x"
     };
     return sendToHost(payload, player, quality, "Local");
   }
