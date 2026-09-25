@@ -880,11 +880,17 @@ class VideoRemuxer:
         # raw does (per-segment on demand) instead of a sequential transcode.
         self.enhance = enhance
         # One GPU job at a time: concurrent vtenhance/ffmpeg runs would split
-        # the shared hardware encoder and all finish late. fg_want holds the
-        # segment indices the player is actively waiting on: the job producing
-        # one of those takes the GPU next, every other background job yields.
-        self.gpu_lock = threading.Lock()
+        # the shared hardware encoder and all finish late. The GPU always goes
+        # to the waiter CLOSEST TO THE PLAYHEAD (lowest segment index, fg_want
+        # first): without this, prefetch jobs grab the GPU in download-completion
+        # order and the segment the player actually needs waits behind them.
+        self.gpu_cv = threading.Condition()
+        self.gpu_busy = False
+        self.gpu_holder = -1          # segment the current GPU job serves
+        self.gpu_proc = None          # its subprocess, for fg preemption
+        self.gpu_waiters: set[int] = set()
         self.fg_want: set[int] = set()
+        self.playhead = 0             # last foreground-requested segment
         # Sub-segment early publish: while vtenhance splits a segment into ~2s
         # sub-segments (--seg-interval), finished subs land here so a seeking
         # player starts after the FIRST sub instead of the whole segment.
@@ -1106,19 +1112,56 @@ class VideoRemuxer:
         return b"".join(parts)
 
     def _gpu_acquire(self, seg_idx: int):
-        """Take the GPU, but let the segment the player is waiting on go first.
+        """Take the GPU in playback order.
 
-        seg_idx < 0 (bootstrap) or membership in fg_want = priority; everyone
-        else polls until no priority job is waiting.
+        Among waiters, fg_want members (player is blocked on them) win; ties
+        and the rest go to the lowest segment index = nearest the playhead.
+        Bootstrap passes -1 and therefore always goes first.
         """
-        while True:
-            self.gpu_lock.acquire()
-            with self.lock:
-                ok = seg_idx < 0 or seg_idx in self.fg_want or not self.fg_want
-            if ok:
-                return
-            self.gpu_lock.release()
-            time.sleep(0.05)
+        with self.gpu_cv:
+            self.gpu_waiters.add(seg_idx)
+            while True:
+                if not self.gpu_busy and seg_idx == self._gpu_next():
+                    self.gpu_waiters.discard(seg_idx)
+                    self.gpu_busy = True
+                    self.gpu_holder = seg_idx
+                    return
+                # Seek preemption: the player is waiting on THIS segment while
+                # the GPU grinds a background prefetch - kill it. The bg job
+                # fails cleanly and its segment gets re-produced on demand.
+                if (seg_idx >= 0 and seg_idx not in self.fg_want
+                        and abs(seg_idx - self.playhead) > 8):
+                    self.gpu_waiters.discard(seg_idx)
+                    raise RuntimeError("stale prefetch (seeked away)")
+                if (self.gpu_busy and seg_idx in self.fg_want
+                        and self.gpu_holder not in self.fg_want
+                        and self.gpu_holder >= 0 and self.gpu_proc is not None):
+                    try:
+                        self.gpu_proc.terminate()
+                    except OSError:
+                        pass
+                    self.gpu_proc = None  # only one kill per job
+                self.gpu_cv.wait(0.1)
+
+    def _gpu_next(self) -> int:
+        # racy read of fg_want/playhead is fine: worst case one stale round.
+        # Priority: fg_want (player blocked), then distance from playhead -
+        # NOT absolute index, or prefetch left over from an earlier seek
+        # position would starve the new position (observed: seg34 beating
+        # seg101 after a seek to 100).
+        fg = self.gpu_waiters & self.fg_want
+        if fg:
+            return min(fg)
+        ph = self.playhead
+        return min(self.gpu_waiters, key=lambda j: (abs(j - ph), j)) \
+            if self.gpu_waiters else -1
+
+    def _gpu_release(self):
+        with self.gpu_cv:
+            self.gpu_busy = False
+            self.gpu_holder = -1
+            self.gpu_proc = None
+            self.gpu_cv.notify_all()
 
     def _publish_partials(self, i: int, outd: str, stop: threading.Event):
         """Poll vtenhance's output dir; publish finished sub-segments early.
@@ -1177,6 +1220,7 @@ class VideoRemuxer:
         n = self.subcount(i)
         if m < 0 or m >= n:
             return None
+        self.playhead = i
         with self.lock:
             cached = self.cache.get(i)
             producing = i in self.inflight
@@ -1263,14 +1307,21 @@ class VideoRemuxer:
                                        args=(seg_idx, outd, stop_pub), daemon=True)
                 pub.start()
             try:
-                res = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.PIPE, text=True)
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE, text=True)
+                with self.gpu_cv:
+                    self.gpu_proc = proc
+                _, perr = proc.communicate()
+                res = subprocess.CompletedProcess(cmd, proc.returncode, None, perr)
             finally:
-                self.gpu_lock.release()
+                self._gpu_release()
                 stop_pub.set()
                 if pub:
                     pub.join(timeout=5)
             if res.returncode != 0:
+                if res.returncode == -15:  # SIGTERM = seek preempted us
+                    log(f"enhance seg{seg_idx} preempted by seek")
+                    raise RuntimeError("enhance preempted")
                 tail = (res.stderr or "").strip().splitlines()[-1:] or ["?"]
                 log(f"enhance segment failed (rc={res.returncode}): {tail[0][:200]}")
                 if os.environ.get("YTPLAY_ENHANCE_DEBUG"):
@@ -1322,8 +1373,21 @@ class VideoRemuxer:
         return bytes(d)
 
     # -- public -------------------------------------------------------------- #
-    def _produce(self, i: int, parallel: bool = True) -> list:
-        init, subs = self._remux(self._mini(i, parallel=parallel), seg_idx=i)
+    def _produce(self, i: int, parallel: bool = True, chain: bool = False) -> list:
+        t0 = time.time()
+        mini = self._mini(i, parallel=parallel)
+        t_dl = time.time() - t0
+        if chain:
+            # Download of the NEXT segments overlaps our GPU time: by the time
+            # this segment finishes enhancing, the next is ready to enhance.
+            # Only foreground requests chain (window slides with playback),
+            # so prefetch can't cascade unbounded.
+            self._prefetch(i)
+        t1 = time.time()
+        init, subs = self._remux(mini, seg_idx=i)
+        if self.enhance:
+            log(f"seg{i}: dl {t_dl:.1f}s gpu(wait+run) {time.time() - t1:.1f}s"
+                f" ({len(mini) >> 20}MB, {'fg' if parallel else 'bg'})")
         return self._patch_subs(subs, self.segments[i][0])
 
     def _patch_subs(self, subs: list, seg_start: float) -> list:
@@ -1358,6 +1422,7 @@ class VideoRemuxer:
                 # so queued prefetch for the OLD position bails instead of
                 # competing with this fetch for proxy bandwidth
                 self.gen += 1
+                self.playhead = i
                 ev = self.inflight.get(i)
                 if ev is None:
                     ev = threading.Event(); self.inflight[i] = ev
@@ -1382,10 +1447,9 @@ class VideoRemuxer:
                     got = self.cache.get(i)
                     return b"".join(got) if got is not None else None
             try:
-                data = self._produce(i)
+                data = self._produce(i, chain=True)
                 with self.lock:
                     self._store(i, data)
-                self._prefetch(i)
                 return b"".join(data)
             except (RuntimeError, http.client.HTTPException, OSError) as err:
                 log(f"vremux seg {i} failed: {err!r}")
@@ -1410,7 +1474,8 @@ class VideoRemuxer:
         # on the shared FIFO pool). The rest stay gentle single-connection.
         with self.lock:
             gen = self.gen
-        for j in range(i + 1, min(i + 1 + self.AHEAD, len(self.segments))):
+        ahead = 4 if self.enhance else self.AHEAD  # each enhanced seg costs GPU
+        for j in range(i + 1, min(i + 1 + ahead, len(self.segments))):
             with self.lock:
                 if j in self.cache or j in self.inflight:
                     continue
@@ -1698,6 +1763,15 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
             last_activity["t"] = time.time()
             path, _, query = self.path.partition("?")
             params = urllib.parse.parse_qs(query)
+            if os.environ.get("YTPLAY_REQLOG"):
+                t0 = time.time()
+                try:
+                    return self._do_get(path, params)
+                finally:
+                    log(f"req {path} {time.time() - t0:.2f}s")
+            return self._do_get(path, params)
+
+        def _do_get(self, path, params):
 
             playlist = playlists.get(path)
             if playlist is not None:
