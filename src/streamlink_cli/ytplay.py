@@ -1822,8 +1822,73 @@ class HlsRemuxer(VideoRemuxer):
                 time.sleep(min(0.5, 0.15 * (k + 1)))
         raise err or RuntimeError("hls fetch failed")
 
+    def _fetch_url_parallel(self, url: str) -> bytes:
+        # Split the segment across parallel Range requests (fresh exits) so a
+        # seek's ~7MB fetch isn't one slow single-connection download behind
+        # the prefetch traffic. Falls back to whole-GET when Range isn't offered.
+        from concurrent.futures import TimeoutError as FutTimeout
+        try:
+            probe = self._hls.open(url, "bytes=0-0")
+            cr = probe.headers.get("Content-Range", "")
+            probe.read()
+            total = int(cr.rsplit("/", 1)[1]) if "/" in cr else 0
+        except Exception:  # noqa: BLE001
+            total = 0
+        if total <= self.FETCH_CHUNK:
+            return self._fetch_url(url)
+        n = min(6, (total + self.FETCH_CHUNK - 1) // self.FETCH_CHUNK)
+        step = (total + n - 1) // n
+        ranges = [(k * step, min(total - 1, (k + 1) * step - 1)) for k in range(n)]
+
+        def one(a, b):
+            for _ in range(6):
+                try:
+                    r = self._hls.open(url, f"bytes={a}-{b}")
+                    data = r.read()
+                    if len(data) == b - a + 1:
+                        return data
+                except Exception:  # noqa: BLE001
+                    time.sleep(0.2)
+            raise RuntimeError(f"chunk {a}-{b} failed")
+        futs = [self.chunk_pool.submit(one, a, b) for a, b in ranges]
+        try:
+            return b"".join(f.result(timeout=90) for f in futs)
+        except FutTimeout:
+            return self._fetch_url(url)
+
     def _mini(self, i: int, parallel: bool = True) -> bytes:
-        return self._src_init + self._fetch_url(self._seg_urls[i])
+        # Cache the raw source segment: on a seek the video enhance AND the
+        # separate audio extract both need segment i - without this they each
+        # re-download the same ~8s file (doubling seek latency). Small cap;
+        # inflight dedup so concurrent video+audio share one download.
+        if not hasattr(self, "_raw"):
+            from collections import OrderedDict
+            self._raw: "OrderedDict[int, bytes]" = OrderedDict()
+            self._raw_lock = threading.Lock()
+            self._raw_inflight: dict[int, threading.Event] = {}
+        with self._raw_lock:
+            if i in self._raw:
+                self._raw.move_to_end(i)
+                return self._raw[i]
+            ev = self._raw_inflight.get(i)
+            mine = ev is None
+            if mine:
+                ev = threading.Event(); self._raw_inflight[i] = ev
+        if not mine:
+            ev.wait(timeout=90)
+            with self._raw_lock:
+                return self._raw.get(i) or (self._src_init + self._fetch_url_parallel(self._seg_urls[i]))
+        try:
+            data = self._src_init + self._fetch_url_parallel(self._seg_urls[i])
+            with self._raw_lock:
+                self._raw[i] = data
+                while len(self._raw) > 5:
+                    self._raw.popitem(last=False)
+            return data
+        finally:
+            with self._raw_lock:
+                self._raw_inflight.pop(i, None)
+            ev.set()
 
     # --- separate audio rendition (muxed source -> its own EXT-X-MEDIA group) --
     # SenPlayer only plays audio declared as a separate rendition, so we extract
@@ -2186,6 +2251,13 @@ def make_handler(playlists: dict[str, str], upstreams: dict[str, Upstream],
                         # otherwise a seek pays a cold proxy fetch for audio
                         # AFTER the video buffer is already filled
                         ap.warm_at(remux.segments[si][0] + sm * remux.SUB_S)
+                    # Muxed HLS: warm this segment's separate audio rendition (and
+                    # the next) in the background so a seek's audio is ready by the
+                    # time the player requests it - reuses the cached raw segment.
+                    if sm == 0 and hasattr(remux, "audio_segment"):
+                        for aj in (si, si + 1):
+                            threading.Thread(target=remux.audio_segment,
+                                             args=(aj,), daemon=True).start()
                     data = remux.get_sub(si, sm)
                     if data is None:
                         self.send_error(404)
