@@ -157,6 +157,21 @@ def _remux_tier(quality: str) -> bool:
 ENHANCE_MPX_PER_S = 300_000_000
 ENHANCE_SHADER = "CuNNy-4x12-DS.glsl"      # quality-tier CNN luma upscaler
 
+# Native speed tier (vtenhance): VT decode -> MetalFX Spatial -> VT HEVC encode,
+# all zero-copy IOSurface. Measured 80-90fps at 4K on M2 Pro = ~700 Mpx/s;
+# budget below that so per-segment enhance stays ahead of playback.
+ENHANCE_MPX_METALFX = 550_000_000
+
+
+def _vtenhance_path() -> str | None:
+    """The native enhance binary (~/Dev/metalenhance), if built/installed."""
+    for c in (os.environ.get("YTPLAY_VTENHANCE"),
+              os.path.expanduser("~/Dev/metalenhance/.build/release/vtenhance"),
+              "/usr/local/bin/vtenhance", "/opt/homebrew/bin/vtenhance"):
+        if c and os.path.exists(c):
+            return c
+    return None
+
 
 def _shader_path(name: str) -> str | None:
     here = os.path.dirname(os.path.abspath(__file__))
@@ -182,22 +197,25 @@ def enhance_plan(width: int, height: int, fps: float, mode: str) -> tuple[int, i
         return None
     fps = fps or 30.0
     src_px = width * height
-    budget_px = ENHANCE_MPX_PER_S / max(fps, 1.0)
+    mpx = ENHANCE_MPX_METALFX if mode == "speed" else ENHANCE_MPX_PER_S
+    budget_px = mpx / max(fps, 1.0)
     scale = min(2.0, (budget_px / src_px) ** 0.5)
     if scale < 1.2:
         return None
     return (int(width * scale) // 2 * 2, int(height * scale) // 2 * 2)
 
 
-def format_selector(quality: str) -> str:
+def format_selector(quality: str, enhance: bool = False) -> str:
     height = _height_ceiling(quality)
     h = f"[height<={height}]"
     # M1/M2 >1080p: take vp9 webm + AAC m4a for remux mode (extract_streams
     # routes this pair to on-the-fly fMP4-HLS repackaging). Kept above the av01
     # branch so it wins; <=1080p and M3+ fall straight through to av01 sidx.
+    # Enhance also prefers webm at any height: the native per-segment enhance
+    # tier needs the webm Cues index for random access.
     vp9_remux = (
         f"bv*{h}[vcodec^=vp9][ext=webm]+ba[ext=m4a][protocol=https]/"
-        if _remux_tier(quality) else ""
+        if (_remux_tier(quality) or enhance) else ""
     )
     # Preference order:
     #   0.   (M1/M2 >1080p) vp9 webm + AAC -> remux mode, hw decode
@@ -243,9 +261,9 @@ def _cookie_args(cookies: str | None) -> list[str]:
 
 
 def _run_ytdlp(url: str, quality: str, proxy: str | None, cookies: str | None,
-               timeout: int, fmt: str | None = None) -> dict:
+               timeout: int, fmt: str | None = None, enhance: bool = False) -> dict:
     cmd = ["yt-dlp", "--no-update", "--no-playlist", "--dump-json",
-           "-f", fmt or format_selector(quality), url]
+           "-f", fmt or format_selector(quality, enhance), url]
     if proxy:
         cmd += ["--proxy", proxy]
     cmd += _cookie_args(cookies)
@@ -268,7 +286,8 @@ def _direct_reachable(url: str, timeout: float = 2.5) -> bool:
         return False
 
 
-def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | None) -> dict:
+def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | None,
+                    enhance: bool = False) -> dict:
     """Extract streams, keeping extract IP == relay IP.
 
     Many CDNs (phncdn, ...) sign the requesting IP into media URLs, so the IP
@@ -281,12 +300,12 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
     primary = None if use_direct else proxy
     log("extracting streams (" + ("direct" if use_direct else "proxy") + ")...")
     try:
-        data = _run_ytdlp(url, quality, primary, cookies, timeout=120)
+        data = _run_ytdlp(url, quality, primary, cookies, timeout=120, enhance=enhance)
         used_proxy = primary
     except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as err:
         if use_direct and proxy:
             log("direct failed (" + str(err)[:120] + "), retrying via proxy...")
-            data = _run_ytdlp(url, quality, proxy, cookies, timeout=180)
+            data = _run_ytdlp(url, quality, proxy, cookies, timeout=180, enhance=enhance)
             used_proxy = proxy
         else:
             raise
@@ -404,6 +423,7 @@ class Upstream:
 
     def fetch_range(self, start: int, end: int) -> bytes:
         rng = f"bytes={start}-{end}"
+        want = end - start + 1
         err: Exception | None = None
         for i in range(self.RETRIES):
             try:
@@ -412,11 +432,21 @@ class Upstream:
                 if res.will_close:
                     self._local.conn = None
                 if res.status < 400:
-                    return body
-                err = UpstreamHTTPError(res.status)
+                    # Rotating-proxy exits sometimes return a truncated or empty
+                    # body with a clean 2xx: verify against what the server said
+                    # it was sending (Content-Range end may be EOF-clamped below
+                    # our request - that clamped length is the correct one).
+                    cr = res.headers.get("Content-Range", "")
+                    m = re.match(r"bytes (\d+)-(\d+)/", cr)
+                    expect = (int(m.group(2)) - int(m.group(1)) + 1) if m else want
+                    if len(body) == expect:
+                        return body
+                    err = RuntimeError(f"short read {len(body)}/{expect}")
+                else:
+                    err = UpstreamHTTPError(res.status)
             except (http.client.HTTPException, OSError) as exc:
                 err = exc
-            # bad exit (403) or a dropped connection: get a fresh exit next try
+            # bad exit (403/short read) or dropped connection: fresh exit next try
             self._drop()
             time.sleep(min(0.4, 0.1 * (i + 1)))
         raise err or RuntimeError("fetch failed")
@@ -815,11 +845,20 @@ class VideoRemuxer:
         # seek all come free from this class, so enhanced playback seeks like
         # raw does (per-segment on demand) instead of a sequential transcode.
         self.enhance = enhance
+        # One GPU job at a time: concurrent vtenhance/ffmpeg runs would split
+        # the shared hardware encoder and all finish late. fg_want holds the
+        # segment indices the player is actively waiting on: the job producing
+        # one of those takes the GPU next, every other background job yields.
+        self.gpu_lock = threading.Lock()
+        self.fg_want: set[int] = set()
         self.up = Upstream(url, proxy, headers)
         head, self.total = self._fetch_head()  # one request: head bytes + file size
         self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
-        while (not self.cues or self.first_cluster is None) and len(head) < self.HEAD_MAX:
-            head += self.up.fetch_range(len(head), min(len(head) * 2, self.HEAD_MAX) - 1)
+        while (not self.cues or self.first_cluster is None) and len(head) < min(self.HEAD_MAX, self.total):
+            more = self.up.fetch_range(len(head), min(len(head) * 2, self.HEAD_MAX) - 1)
+            if not more:
+                break  # EOF/upstream stall: fall through to the error below
+            head += more
             self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
         if not self.cues or self.first_cluster is None:
             raise RuntimeError("webm Cues not found in head")
@@ -1024,7 +1063,22 @@ class VideoRemuxer:
             parts.append(winner.result())
         return b"".join(parts)
 
-    def _remux(self, mini: bytes):
+    def _gpu_acquire(self, seg_idx: int):
+        """Take the GPU, but let the segment the player is waiting on go first.
+
+        seg_idx < 0 (bootstrap) or membership in fg_want = priority; everyone
+        else polls until no priority job is waiting.
+        """
+        while True:
+            self.gpu_lock.acquire()
+            with self.lock:
+                ok = seg_idx < 0 or seg_idx in self.fg_want or not self.fg_want
+            if ok:
+                return
+            self.gpu_lock.release()
+            time.sleep(0.05)
+
+    def _remux(self, mini: bytes, seg_idx: int = -1):
         import tempfile
         d = tempfile.mkdtemp(prefix="seg-", dir=self._tmp)
         src = os.path.join(d, "in.webm")
@@ -1032,7 +1086,26 @@ class VideoRemuxer:
             f.write(mini)
         # No -copyts: timestamps reset to 0 so the init is identical for every
         # segment (shared EXT-X-MAP); we position each via a patched tfdt.
-        if self.enhance:
+        if self.enhance and self.enhance[2] == "native":
+            # Native zero-copy enhance (vtenhance): VT decode -> MetalFX Spatial
+            # AI upscale -> VT HEVC encode, every frame on IOSurface. Fast
+            # enough (~80fps at 4K) that per-segment enhance keeps up with
+            # playback AND random seeks - the tier ffmpeg could never reach.
+            ow, oh, _ = self.enhance
+            mbit = 25 if oh >= 2000 else 16 if oh >= 1400 else 10
+            frag = os.path.join(d, "in.mp4")
+            fres = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
+                                   "-i", src, "-c", "copy", "-f", "mp4",
+                                   "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                                   frag], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE, text=True)
+            frag_ok = fres.returncode == 0 and os.path.exists(frag) and os.path.getsize(frag) > 0
+            if not frag_ok:
+                tail = (fres.stderr or "").strip().splitlines()[-1:] or ["?"]
+                log(f"enhance frag step failed (rc={fres.returncode}): {tail[0][:200]}")
+            cmd = [_vtenhance_path() or "vtenhance", frag, d, "--hls",
+                   "--scale", f"{ow}x{oh}", "--bitrate", str(mbit)]
+        elif self.enhance:
             # GPU upscale this segment (VideoToolbox decode -> Metal shader ->
             # VideoToolbox HEVC encode). Per-segment, so seeking anywhere only
             # enhances the segments actually requested.
@@ -1053,7 +1126,23 @@ class VideoRemuxer:
                    "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4",
                    "-hls_segment_filename", os.path.join(d, "s%03d.m4s"),
                    os.path.join(d, "i.m3u8")]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if self.enhance:
+            self._gpu_acquire(seg_idx)
+            try:
+                res = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.PIPE, text=True)
+            finally:
+                self.gpu_lock.release()
+            if res.returncode != 0:
+                tail = (res.stderr or "").strip().splitlines()[-1:] or ["?"]
+                log(f"enhance segment failed (rc={res.returncode}): {tail[0][:200]}")
+                if os.environ.get("YTPLAY_ENHANCE_DEBUG"):
+                    import shutil as _sh
+                    keep = f"/tmp/enh-fail-{int(time.time())}"
+                    _sh.copytree(d, keep, dirs_exist_ok=True)
+                    log(f"enhance debug: inputs kept at {keep}")
+        else:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         init_p = os.path.join(d, "init.mp4")
         segs = sorted(f for f in os.listdir(d) if f.endswith(".m4s"))
         init = open(init_p, "rb").read() if os.path.exists(init_p) else b""
@@ -1094,7 +1183,7 @@ class VideoRemuxer:
 
     # -- public -------------------------------------------------------------- #
     def _produce(self, i: int, parallel: bool = True) -> bytes:
-        init, m4s = self._remux(self._mini(i, parallel=parallel))
+        init, m4s = self._remux(self._mini(i, parallel=parallel), seg_idx=i)
         return self._patch(m4s, self.segments[i][0])
 
     def get_segment(self, i: int) -> bytes | None:
@@ -1122,25 +1211,33 @@ class VideoRemuxer:
         if mine is None:              # cache hit
             self._prefetch(i)         # (outside the lock: _prefetch takes it)
             return data
-        if not mine:                  # actively downloading in the background
-            ev.wait(timeout=120)
-            with self.lock:
-                return self.cache.get(i)
+        # The player is now blocked on segment i: give whichever job produces
+        # it (this thread or a background one already running) GPU priority.
+        with self.lock:
+            self.fg_want.add(i)
         try:
-            data = self._produce(i)
-            with self.lock:
-                self._store(i, data)
-            self._prefetch(i)
-            return data
-        except (RuntimeError, http.client.HTTPException, OSError) as err:
-            log(f"vremux seg {i} failed: {err!r}")
-            return None
+            if not mine:              # actively producing in the background
+                ev.wait(timeout=120)
+                with self.lock:
+                    return self.cache.get(i)
+            try:
+                data = self._produce(i)
+                with self.lock:
+                    self._store(i, data)
+                self._prefetch(i)
+                return data
+            except (RuntimeError, http.client.HTTPException, OSError) as err:
+                log(f"vremux seg {i} failed: {err!r}")
+                return None
+            finally:
+                with self.lock:
+                    if self.inflight.get(i) is ev:
+                        self.inflight.pop(i)
+                    self.started.discard(i)
+                ev.set()
         finally:
             with self.lock:
-                if self.inflight.get(i) is ev:
-                    self.inflight.pop(i)
-                self.started.discard(i)
-            ev.set()
+                self.fg_want.discard(i)
 
     def _prefetch(self, i: int, hot: int = 2):
         # After a seek the player buffers ~3 segments before resuming, so the
@@ -1604,7 +1701,8 @@ def main() -> int:
     if not cookies_arg and args.cookies_from_browser:
         cookies_arg = "browser:" + args.cookies_from_browser
     try:
-        info = extract_streams(args.url, args.quality, proxy, cookies_arg)
+        info = extract_streams(args.url, args.quality, proxy, cookies_arg,
+                               enhance=(args.enhance == "speed" and _vtenhance_path() is not None))
     except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as err:
         log("error: " + str(err))
         notify_mac("ytplay failed", str(err))
@@ -1629,14 +1727,21 @@ def main() -> int:
     # back to the sequential EnhancePipe when the source has no webm/Cues.
     vsrc = info.get("video") or info.get("media") or {}
     enh_shader = _shader_path(ENHANCE_SHADER) if args.enhance else None
+    enh_native_bin = _vtenhance_path() if args.enhance == "speed" else None
     enh_plan = (enhance_plan(int(vsrc.get("width") or 0), int(vsrc.get("height") or 0),
                              float(vsrc.get("fps") or 30), args.enhance)
-                if enh_shader else None)
+                if (enh_shader or enh_native_bin) else None)
     if args.enhance and enh_plan is None:
         log(f"enhance: source {vsrc.get('width')}x{vsrc.get('height')} not upscaled "
-            f"({'no shader' if not enh_shader else 'already high / not worth it'}); raw mode")
+            f"({'no engine' if not (enh_shader or enh_native_bin) else 'already high / not worth it'}); raw mode")
 
-    if enh_plan is not None:
+    # Native tier (speed mode): when the source is a vp9 webm with Cues (remux
+    # mode) and vtenhance is built, enhance per segment inside VideoRemuxer -
+    # zero-copy MetalFX at ~80fps keeps up with playback AND random seeks.
+    # ffmpeg tiers can't do both, so anything else falls to sequential CuNNy.
+    enh_native = bool(enh_plan and enh_native_bin and info.get("mode") == "remux")
+
+    if enh_plan is not None and not enh_native:
         ow, oh = enh_plan
         fpsv = vsrc.get("fps") or 30
         log(f"mode=enhance {vsrc.get('width')}x{vsrc.get('height')}@{fpsv} -> {ow}x{oh} CuNNy")
@@ -1655,22 +1760,31 @@ def main() -> int:
             pipe.cleanup()
             enh_plan = None
 
-    if enh_plan is not None:
+    if enh_plan is not None and not enh_native:
         pass  # enhance path set entry above; skip source-mode dispatch
     elif info["mode"] == "remux":
         # vp9 webm -> fMP4 (M1/M2 >1080p): video is repackaged on demand from the
         # webm Cues index (random access -> seek anywhere in ~1 fetch); audio is a
         # separate rendition served byte-range from the m4a sidx, exactly like sidx
         # mode. Both are complete VOD playlists -> full seek bar + edge-play.
+        # With enh_native, each segment additionally runs through vtenhance
+        # (zero-copy MetalFX upscale) between remux and serving.
         video, audio = info["video"], info["audio"]
-        log(f"mode=remux {video.get('format_id')} {video.get('width')}x{video.get('height')} "
-            f"{video.get('vcodec')} + {audio.get('format_id')} -> fMP4 random-access")
+        vr_enhance = None
+        if enh_native:
+            ow, oh = enh_plan
+            vr_enhance = (ow, oh, "native")
+            log(f"mode=remux+native-enhance {video.get('width')}x{video.get('height')}"
+                f"@{vsrc.get('fps') or 30} -> {ow}x{oh} MetalFX zero-copy")
+        else:
+            log(f"mode=remux {video.get('format_id')} {video.get('width')}x{video.get('height')} "
+                f"{video.get('vcodec')} + {audio.get('format_id')} -> fMP4 random-access")
         a_up = Upstream(audio["url"], proxy, audio.get("http_headers"))
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:  # video head ∥ audio sidx
                 r_future = pool.submit(VideoRemuxer, video["url"], proxy,
                                        video.get("http_headers"),
-                                       info.get("duration") or 0)
+                                       info.get("duration") or 0, vr_enhance)
                 a_future = pool.submit(parse_sidx, a_up)
                 remux = r_future.result(timeout=90)
                 a_init, a_segs = a_future.result(timeout=90)
@@ -1680,6 +1794,11 @@ def main() -> int:
             if remux:
                 remux.cleanup()
             return 1
+        if enh_native:
+            # The playlist's CODECS must describe the ENHANCED stream (hvc1),
+            # not the vp9 source, or players reject the variant.
+            ow, oh = enh_plan
+            video = dict(video, vcodec="hvc1.2.4.L153.B0", width=ow, height=oh)
         playlists = {
             "/master.m3u8": master_playlist(video, audio),
             "/v.m3u8": remux.video_playlist().decode(),
@@ -1687,7 +1806,8 @@ def main() -> int:
         }
         prefetchers = {"/a.mp4": SegmentPrefetcher(a_up, a_init, a_segs, workers=1, ahead=4)}
         entry = "/master.m3u8"
-        quality_note = f"{video.get('height')}p {(video.get('vcodec') or 'vp9').split('.')[0]} remux"
+        quality_note = (f"{enh_plan[1]}p enhanced (MetalFX native)" if enh_native else
+                        f"{video.get('height')}p {(video.get('vcodec') or 'vp9').split('.')[0]} remux")
 
     elif info["mode"] == "sidx":
         video, audio = info["video"], info["audio"]
