@@ -1202,16 +1202,21 @@ class VideoRemuxer:
                 seen += 1
             if stopped:
                 return
-            stop.wait(0.15)
+            stop.wait(0.05)
+
+    # Native-enhance sub-segment length (s). Smaller = finer seek pipelining
+    # (player starts filling its buffer after ~1s of GPU work instead of 2s);
+    # GPU cost per second of video is unchanged. Keyframes every SUB_S.
+    SUB_S = 1.0
 
     def subcount(self, i: int) -> int:
         """Advertised sub-segments for segment i (native enhance playlists).
 
-        floor(dur/2) never exceeds what vtenhance actually emits (encoder
-        keyframes are forced to <=2s, so every 2s boundary produces a split);
+        floor(dur/SUB_S) never exceeds what vtenhance actually emits (encoder
+        keyframes are forced to SUB_S, so every boundary produces a split);
         the last advertised sub absorbs any extra actual subs.
         """
-        return max(1, int(self.segments[i][1] // 2))
+        return max(1, int(self.segments[i][1] // self.SUB_S))
 
     def get_sub(self, i: int, m: int) -> bytes | None:
         """Sub-segment m of segment i; serves early from partials during enhance."""
@@ -1275,7 +1280,8 @@ class VideoRemuxer:
             outd = os.path.join(d, "out")
             os.makedirs(outd, exist_ok=True)
             cmd = [_vtenhance_path() or "vtenhance", frag, outd, "--hls",
-                   "--seg-interval", "2", "--scale", f"{ow}x{oh}", "--bitrate", str(mbit)]
+                   "--seg-interval", str(self.SUB_S), "--scale", f"{ow}x{oh}",
+                   "--bitrate", str(mbit)]
         elif self.enhance:
             # GPU upscale this segment (VideoToolbox decode -> Metal shader ->
             # VideoToolbox HEVC encode). Per-segment, so seeking anywhere only
