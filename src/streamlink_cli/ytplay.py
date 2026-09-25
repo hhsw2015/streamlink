@@ -157,10 +157,14 @@ def _remux_tier(quality: str) -> bool:
 ENHANCE_MPX_PER_S = 300_000_000
 ENHANCE_SHADER = "CuNNy-4x12-DS.glsl"      # quality-tier CNN luma upscaler
 
-# Native speed tier (vtenhance): VT decode -> MetalFX Spatial -> VT HEVC encode,
-# all zero-copy IOSurface. Measured 80-90fps at 4K on M2 Pro = ~700 Mpx/s;
-# budget below that so per-segment enhance stays ahead of playback.
+# Native tiers (vtenhance): VT decode -> GPU enhance -> VT HEVC encode, all
+# zero-copy IOSurface. Full-chain measured on M2 Pro, 1080p60 -> 4K:
+#   speed   MetalFX Spatial   88.5 fps (encoder-bound)
+#   quality CuNNy CNN 2x      89.6 fps (encoder-bound - beats old ffmpeg est.)
+#   max     ArtCNN C4F16 2x   61.4 fps (GPU-bound, 1.02x realtime@60)
+# CuNNy/ArtCNN are exact-2x luma CNNs (no arbitrary scaling).
 ENHANCE_MPX_METALFX = 550_000_000
+NATIVE_TIERS = {"speed": [], "quality": ["--cunny"], "max": ["--artcnn"]}
 
 
 def _vtenhance_path() -> str | None:
@@ -182,7 +186,8 @@ def _shader_path(name: str) -> str | None:
     return None
 
 
-def enhance_plan(width: int, height: int, fps: float, mode: str) -> tuple[int, int] | None:
+def enhance_plan(width: int, height: int, fps: float, mode: str,
+                 native: bool = False) -> tuple[int, int] | None:
     """Pick the largest output that keeps the CNN enhancer ahead of playback.
 
     "auto"/"cunny": scale toward 2x, but cap output pixels to the per-frame
@@ -195,6 +200,11 @@ def enhance_plan(width: int, height: int, fps: float, mode: str) -> tuple[int, i
         return None
     if height >= 1440:                     # already high; enhancing it blows the budget
         return None
+    if native:
+        # Native CNN tiers are exact-2x luma by construction; full-chain
+        # throughput (measured 61-90fps at 4K) sustains 2x for any <=1080p60
+        # source, so no budget cap is needed.
+        return (width * 2, height * 2)
     fps = fps or 30.0
     src_px = width * height
     mpx = ENHANCE_MPX_METALFX if mode == "speed" else ENHANCE_MPX_PER_S
@@ -1352,7 +1362,7 @@ class VideoRemuxer:
             f.write(mini)
         # No -copyts: timestamps reset to 0 so the init is identical for every
         # segment (shared EXT-X-MAP); we position each via a patched tfdt.
-        if self.enhance and self.enhance[2] == "native":
+        if self.enhance and self.enhance[2].startswith("native"):
             # Native zero-copy enhance (vtenhance): VT decode -> MetalFX Spatial
             # AI upscale -> VT HEVC encode, every frame on IOSurface. Fast
             # enough (~80fps at 4K) that per-segment enhance keeps up with
@@ -1374,6 +1384,7 @@ class VideoRemuxer:
             cmd = [_vtenhance_path() or "vtenhance", frag, outd, "--hls",
                    "--seg-interval", str(self.SUB_S), "--scale", f"{ow}x{oh}",
                    "--bitrate", str(mbit)]
+            cmd += NATIVE_TIERS.get(self.enhance[2].split(":")[-1], [])
             if sub_from > 0:
                 # Seek landed mid-segment: enhance only from that sub onward.
                 cmd += ["--start", str(sub_from * self.SUB_S)]
@@ -1398,7 +1409,7 @@ class VideoRemuxer:
                    "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4",
                    "-hls_segment_filename", os.path.join(d, "s%03d.m4s"),
                    os.path.join(d, "i.m3u8")]
-        native = self.enhance is not None and self.enhance[2] == "native"
+        native = self.enhance is not None and self.enhance[2].startswith("native")
         if self.enhance:
             self._gpu_acquire(seg_idx)
             stop_pub = threading.Event()
@@ -1619,7 +1630,7 @@ class VideoRemuxer:
 
     def video_playlist(self) -> bytes:
         import math
-        native = self.enhance is not None and self.enhance[2] == "native"
+        native = self.enhance is not None and self.enhance[2].startswith("native")
         if native:
             # Advertise ~2s sub-segments (vsegI_M.m4s): a seek needs only the
             # first sub of the target segment, not the whole enhanced segment.
@@ -2068,8 +2079,8 @@ def main() -> int:
     parser.add_argument("--idle-timeout", type=int, default=0,
                         help="exit N seconds after the last request (0 = run until killed)")
     parser.add_argument("--enhance", default="", metavar="MODE",
-                        help="GPU AI upscale: auto|cunny (smart CNN, framerate-safe res). "
-                             "Empty = off.")
+                        help="GPU AI upscale: speed (MetalFX) | quality (CuNNy) | "
+                             "max (ArtCNN). Empty = off.")
     args = parser.parse_args()
 
     proxy = args.proxy if args.proxy else detect_proxy()
@@ -2083,7 +2094,8 @@ def main() -> int:
         cookies_arg = "browser:" + args.cookies_from_browser
     try:
         info = extract_streams(args.url, args.quality, proxy, cookies_arg,
-                               enhance=(args.enhance == "speed" and _vtenhance_path() is not None))
+                               enhance=(args.enhance in ("speed", "quality", "max")
+                                        and _vtenhance_path() is not None))
     except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as err:
         log("error: " + str(err))
         notify_mac("ytplay failed", str(err))
@@ -2108,18 +2120,22 @@ def main() -> int:
     # back to the sequential EnhancePipe when the source has no webm/Cues.
     vsrc = info.get("video") or info.get("media") or {}
     enh_shader = _shader_path(ENHANCE_SHADER) if args.enhance else None
-    enh_native_bin = _vtenhance_path() if args.enhance == "speed" else None
+    enh_native_bin = (_vtenhance_path()
+                      if args.enhance in ("speed", "quality", "max") else None)
+    _native_ok = bool(enh_native_bin and info.get("mode") == "remux")
     enh_plan = (enhance_plan(int(vsrc.get("width") or 0), int(vsrc.get("height") or 0),
-                             float(vsrc.get("fps") or 30), args.enhance)
+                             float(vsrc.get("fps") or 30), args.enhance,
+                             native=_native_ok)
                 if (enh_shader or enh_native_bin) else None)
     if args.enhance and enh_plan is None:
         log(f"enhance: source {vsrc.get('width')}x{vsrc.get('height')} not upscaled "
             f"({'no engine' if not (enh_shader or enh_native_bin) else 'already high / not worth it'}); raw mode")
 
-    # Native tier (speed mode): when the source is a vp9 webm with Cues (remux
-    # mode) and vtenhance is built, enhance per segment inside VideoRemuxer -
-    # zero-copy MetalFX at ~80fps keeps up with playback AND random seeks.
-    # ffmpeg tiers can't do both, so anything else falls to sequential CuNNy.
+    # Native tiers: when the source is a vp9 webm with Cues (remux mode) and
+    # vtenhance is built, enhance per segment inside VideoRemuxer (zero-copy,
+    # random access). speed=MetalFX 88fps, quality=CuNNy 89fps, max=ArtCNN
+    # 61fps - all >=1x realtime@60 at 4K on M2 Pro. Sources without webm fall
+    # back to the sequential ffmpeg CuNNy pipe.
     enh_native = bool(enh_plan and enh_native_bin and info.get("mode") == "remux")
 
     if enh_plan is not None and not enh_native:
@@ -2154,9 +2170,10 @@ def main() -> int:
         vr_enhance = None
         if enh_native:
             ow, oh = enh_plan
-            vr_enhance = (ow, oh, "native")
+            vr_enhance = (ow, oh, "native:" + args.enhance)
+            engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
             log(f"mode=remux+native-enhance {video.get('width')}x{video.get('height')}"
-                f"@{vsrc.get('fps') or 30} -> {ow}x{oh} MetalFX zero-copy")
+                f"@{vsrc.get('fps') or 30} -> {ow}x{oh} {engine} zero-copy")
         else:
             log(f"mode=remux {video.get('format_id')} {video.get('width')}x{video.get('height')} "
                 f"{video.get('vcodec')} + {audio.get('format_id')} -> fMP4 random-access")
@@ -2189,7 +2206,7 @@ def main() -> int:
         # sequential read-ahead on a single connection
         prefetchers = {"/a.mp4": SegmentPrefetcher(a_up, a_init, a_segs, workers=2, ahead=4)}
         entry = "/master.m3u8"
-        quality_note = (f"{enh_plan[1]}p enhanced (MetalFX native)" if enh_native else
+        quality_note = (f"{enh_plan[1]}p enhanced (native)" if enh_native else
                         f"{video.get('height')}p {(video.get('vcodec') or 'vp9').split('.')[0]} remux")
 
     elif info["mode"] == "sidx":

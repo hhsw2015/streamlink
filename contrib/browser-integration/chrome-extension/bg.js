@@ -62,8 +62,9 @@ async function rebuildMenus() {
   });
   const ENH = [
     ["off", "关闭"],
-    ["quality", "质量优先 (AI 超分, 画质最佳)"],
-    ["speed", "速度优先 (4K60, 最流畅)"],
+    ["speed", "速度 (MetalFX, 最流畅)"],
+    ["quality", "质量 (CuNNy AI 超分)"],
+    ["max", "极限画质 (ArtCNN, 最强细节)"],
   ];
   for (const [mode, label] of ENH) {
     chrome.contextMenus.create({
