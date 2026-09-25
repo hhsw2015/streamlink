@@ -167,6 +167,31 @@ ENHANCE_MPX_METALFX = 550_000_000
 NATIVE_TIERS = {"speed": [], "quality": ["--cunny"], "max": ["--artcnn"]}
 
 
+def _denoise_strength(src: dict) -> float:
+    """Bilateral luma denoise strength from source bits-per-pixel.
+
+    Heavily compressed web video (low bpp) carries blocking/mosquito noise a
+    super-resolver would faithfully amplify; a light denoise cleans it first.
+    Well-encoded sources get none. (MetalFX has no denoise hook, so this only
+    applies to the CuNNy/ArtCNN path.)
+    """
+    try:
+        w = int(src.get("width") or 0)
+        h = int(src.get("height") or 0)
+        fps = float(src.get("fps") or 30)
+        tbr = float(src.get("tbr") or 0)   # kbps
+    except (TypeError, ValueError):
+        return 0.0
+    if w <= 0 or h <= 0 or tbr <= 0:
+        return 0.0
+    bpp = (tbr * 1000.0) / (w * h * max(fps, 1.0))
+    if bpp < 0.05:        # e.g. PornHub 1080p30 @~2Mbps ~= 0.032
+        return 0.06
+    if bpp < 0.09:
+        return 0.04
+    return 0.0
+
+
 def _vtenhance_path() -> str | None:
     """The native enhance binary (~/Dev/metalenhance), if built/installed."""
     for c in (os.environ.get("YTPLAY_VTENHANCE"),
@@ -1446,7 +1471,10 @@ class VideoRemuxer:
             cmd += NATIVE_TIERS.get(tier, [])
             if "fps2x" in parts:
                 cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps
-            else:
+            for pt in parts:
+                if pt.startswith("dn"):
+                    cmd += ["--denoise", pt[2:]]  # pre-upscale bilateral denoise
+            if "fps2x" not in parts:
                 # No interpolation = GPU has spare margin -> spend it on a
                 # higher-quality encode (better retention of the CNN's detail).
                 cmd += ["--hq"]
@@ -2554,7 +2582,9 @@ def main() -> int:
             # ArtCNN 46fps output). A source already >=50fps is left alone.
             src_fps = float(vsrc.get("fps") or 30)
             fps2x = src_fps < 35
-            mode_str = "native:" + args.enhance + (":fps2x" if fps2x else "")
+            dn = _denoise_strength(vsrc) if args.enhance in ("quality", "max") else 0.0
+            mode_str = ("native:" + args.enhance + (":fps2x" if fps2x else "")
+                        + (f":dn{dn:.3f}" if dn > 0 else ""))
             vr_enhance = (ow, oh, mode_str)
             engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
             log(f"mode={info['mode']}+native-enhance {video.get('width')}x{video.get('height')}"
@@ -2689,7 +2719,9 @@ def main() -> int:
         ow, oh = enh_plan
         src_fps = float(media.get("fps") or 30)
         fps2x = src_fps < 35
-        mode_str = "native:" + args.enhance + (":fps2x" if fps2x else "")
+        dn = _denoise_strength(media) if args.enhance in ("quality", "max") else 0.0
+        mode_str = ("native:" + args.enhance + (":fps2x" if fps2x else "")
+                    + (f":dn{dn:.3f}" if dn > 0 else ""))
         engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
         log(f"mode=hls+native-enhance {media.get('width')}x{media.get('height')}"
             f"@{src_fps:g} -> {ow}x{oh}{'@60(interp)' if fps2x else ''} {engine} muxed")
