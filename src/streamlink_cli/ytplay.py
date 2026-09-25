@@ -1413,7 +1413,10 @@ class VideoRemuxer:
             # enough (~80fps at 4K) that per-segment enhance keeps up with
             # playback AND random seeks - the tier ffmpeg could never reach.
             ow, oh, _ = self.enhance
-            mbit = 25 if oh >= 2000 else 16 if oh >= 1400 else 10
+            # Higher bitrate than a normal stream: the CNN adds high-frequency
+            # detail a stingy bitrate would immediately crush. Local playback,
+            # so bandwidth is free.
+            mbit = 40 if oh >= 2000 else 24 if oh >= 1400 else 16
             frag = os.path.join(d, "in.mp4")
             fcmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
                     "-i", src, "-c", "copy"]
@@ -1443,6 +1446,10 @@ class VideoRemuxer:
             cmd += NATIVE_TIERS.get(tier, [])
             if "fps2x" in parts:
                 cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps
+            else:
+                # No interpolation = GPU has spare margin -> spend it on a
+                # higher-quality encode (better retention of the CNN's detail).
+                cmd += ["--hq"]
             # (muxed sources serve audio as a SEPARATE rendition - SenPlayer
             # only plays EXT-X-MEDIA audio, not audio muxed in the variant - so
             # the enhance pass stays video-only here.)
