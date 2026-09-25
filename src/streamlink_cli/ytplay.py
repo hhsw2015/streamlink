@@ -892,6 +892,7 @@ class VideoRemuxer:
                               # and medium seeks land inside it and cost nothing
     CACHE_BYTES = 256 << 20  # remuxed segments kept in memory (LRU, byte-capped)
     FETCH_CHUNK = 3 << 20    # split byte ranges across rotating-proxy exits
+    SRC_NAME = "in.webm"     # temp input name for _remux (subclass: "in.mp4")
 
     def __init__(self, url: str, proxy: str | None, headers: dict | None, duration: float,
                  enhance: tuple[int, int, str] | None = None):
@@ -921,20 +922,12 @@ class VideoRemuxer:
         self.partial: dict[int, list[bytes]] = {}
         self.pcond = threading.Condition()
         self.up = Upstream(url, proxy, headers)
-        head, self.total = self._fetch_head()  # one request: head bytes + file size
-        self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
-        while (not self.cues or self.first_cluster is None) and len(head) < min(self.HEAD_MAX, self.total):
-            more = self.up.fetch_range(len(head), min(len(head) * 2, self.HEAD_MAX) - 1)
-            if not more:
-                break  # EOF/upstream stall: fall through to the error below
-            head += more
-            self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
-        if not self.cues or self.first_cluster is None:
-            raise RuntimeError("webm Cues not found in head")
-        self.header = head[:self.first_cluster]
-        starts = [t for t, _ in self.cues]
-        ends = starts[1:] + [max(duration, starts[-1] + 2.0) if duration else starts[-1] + 4.0]
-        self.segments = [(starts[i], max(0.001, ends[i] - starts[i])) for i in range(len(starts))]
+        # Source-specific index -> self.segments [(start_s, dur_s)]. Base builds
+        # it from webm Cues; subclasses (sidx fMP4) override. Everything after
+        # this line (enhance, sub-segments, GPU scheduling, seek, serving) is
+        # source-agnostic, so any source that provides fMP4 segments gets the
+        # full native path - "use native whenever the format allows".
+        self._build_index(duration)
         self.cache: "OrderedDict[int, bytes]" = OrderedDict()
         self.cached_bytes = 0
         self.lock = threading.Lock()
@@ -958,6 +951,23 @@ class VideoRemuxer:
         self.inflight[0] = boot_ev
         self.started.add(0)
         threading.Thread(target=self._bootstrap, args=(boot_ev,), daemon=True).start()
+
+    def _build_index(self, duration: float):
+        """Webm Cues -> self.segments. Also sets self.total/header/seg_data/cues."""
+        head, self.total = self._fetch_head()  # one request: head bytes + file size
+        self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
+        while (not self.cues or self.first_cluster is None) and len(head) < min(self.HEAD_MAX, self.total):
+            more = self.up.fetch_range(len(head), min(len(head) * 2, self.HEAD_MAX) - 1)
+            if not more:
+                break  # EOF/upstream stall: fall through to the error below
+            head += more
+            self.seg_data, self.tcs, self.cues, self.first_cluster = self._parse(head)
+        if not self.cues or self.first_cluster is None:
+            raise RuntimeError("webm Cues not found in head")
+        self.header = head[:self.first_cluster]
+        starts = [t for t, _ in self.cues]
+        ends = starts[1:] + [max(duration, starts[-1] + 2.0) if duration else starts[-1] + 4.0]
+        self.segments = [(starts[i], max(0.001, ends[i] - starts[i])) for i in range(len(starts))]
 
     def _bootstrap(self, ev: threading.Event):
         try:
@@ -1357,7 +1367,7 @@ class VideoRemuxer:
     def _remux(self, mini: bytes, seg_idx: int = -1, sub_from: int = 0):
         import tempfile
         d = tempfile.mkdtemp(prefix="seg-", dir=self._tmp)
-        src = os.path.join(d, "in.webm")
+        src = os.path.join(d, self.SRC_NAME)
         with open(src, "wb") as f:
             f.write(mini)
         # No -copyts: timestamps reset to 0 so the init is identical for every
@@ -1665,6 +1675,36 @@ class VideoRemuxer:
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.chunk_pool.shutdown(wait=False, cancel_futures=True)
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+
+class SidxRemuxer(VideoRemuxer):
+    """Native enhance for DASH fMP4 (sidx) sources - any site serving fMP4.
+
+    The segments are already fMP4, so there is no webm->mp4 transcode: each
+    init+segment concat is a valid fragmented mp4 that feeds vtenhance directly.
+    Everything else (per-segment enhance, sub-segments, GPU scheduling, seek,
+    audio warm) is inherited unchanged - this is the "use native whenever the
+    format allows" seam.
+    """
+    SRC_NAME = "insrc.mp4"    # distinct from _remux's frag output "in.mp4"
+
+    def _build_index(self, duration: float):
+        self.data_anchor, segs = parse_sidx(self.up)
+        if not segs:
+            raise RuntimeError("sidx has no segments")
+        self.sidx_init = self.up.fetch_range(0, self.data_anchor - 1)
+        self.seg_ranges = [(off, off + size - 1) for off, size, _ in segs]
+        starts, t = [], 0.0
+        for _off, _size, d in segs:
+            starts.append(t)
+            t += d
+        self.segments = [(starts[i], max(0.001, segs[i][2])) for i in range(len(segs))]
+        self.total = self.seg_ranges[-1][1] + 1
+
+    def _mini(self, i: int, parallel: bool = True) -> bytes:
+        a, b = self.seg_ranges[i]
+        body = self._fetch_parallel(a, b) if parallel else self.up.fetch_range(a, b)
+        return self.sidx_init + body
 
 
 class EnhancePipe:
@@ -2140,7 +2180,11 @@ def main() -> int:
     # random access). speed=MetalFX 88fps, quality=CuNNy 89fps, max=ArtCNN
     # 61fps - all >=1x realtime@60 at 4K on M2 Pro. Sources without webm fall
     # back to the sequential ffmpeg CuNNy pipe.
-    enh_native = bool(enh_plan and enh_native_bin and info.get("mode") == "remux")
+    # Native whenever the format allows: remux (webm Cues) and sidx (fMP4) both
+    # give per-segment random access, so both take the zero-copy native path.
+    # Other modes (progressive/hls) still fall back to the sequential pipe.
+    enh_native = bool(enh_plan and enh_native_bin
+                      and info.get("mode") in ("remux", "sidx"))
 
     if enh_plan is not None and not enh_native:
         ow, oh = enh_plan
@@ -2163,13 +2207,15 @@ def main() -> int:
 
     if enh_plan is not None and not enh_native:
         pass  # enhance path set entry above; skip source-mode dispatch
-    elif info["mode"] == "remux":
-        # vp9 webm -> fMP4 (M1/M2 >1080p): video is repackaged on demand from the
-        # webm Cues index (random access -> seek anywhere in ~1 fetch); audio is a
-        # separate rendition served byte-range from the m4a sidx, exactly like sidx
-        # mode. Both are complete VOD playlists -> full seek bar + edge-play.
-        # With enh_native, each segment additionally runs through vtenhance
-        # (zero-copy MetalFX upscale) between remux and serving.
+    elif info["mode"] == "remux" or (enh_native and info["mode"] == "sidx"):
+        # Native random-access enhance path, shared by two source shapes:
+        #   remux = vp9 webm (YouTube >1080p on M1/M2): repackaged from Cues.
+        #   sidx  = fMP4 pair (any site, av01/avc1/vp09-in-mp4): segments are
+        #           already fMP4, fed to vtenhance with no transcode.
+        # Video is repackaged/enhanced on demand per segment (seek anywhere in
+        # ~1 fetch); audio is a separate rendition served byte-range from its
+        # sidx. Both are complete VOD playlists -> full seek bar + edge-play.
+        RemuxCls = VideoRemuxer if info["mode"] == "remux" else SidxRemuxer
         video, audio = info["video"], info["audio"]
         vr_enhance = None
         if enh_native:
@@ -2182,7 +2228,7 @@ def main() -> int:
             mode_str = "native:" + args.enhance + (":fps2x" if fps2x else "")
             vr_enhance = (ow, oh, mode_str)
             engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
-            log(f"mode=remux+native-enhance {video.get('width')}x{video.get('height')}"
+            log(f"mode={info['mode']}+native-enhance {video.get('width')}x{video.get('height')}"
                 f"@{src_fps:g} -> {ow}x{oh}"
                 f"{'@60(interp)' if fps2x else ''} {engine} zero-copy")
         else:
@@ -2191,7 +2237,7 @@ def main() -> int:
         a_up = Upstream(audio["url"], proxy, audio.get("http_headers"))
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:  # video head ∥ audio sidx
-                r_future = pool.submit(VideoRemuxer, video["url"], proxy,
+                r_future = pool.submit(RemuxCls, video["url"], proxy,
                                        video.get("http_headers"),
                                        info.get("duration") or 0, vr_enhance)
                 a_future = pool.submit(parse_sidx, a_up)
