@@ -1384,7 +1384,11 @@ class VideoRemuxer:
             cmd = [_vtenhance_path() or "vtenhance", frag, outd, "--hls",
                    "--seg-interval", str(self.SUB_S), "--scale", f"{ow}x{oh}",
                    "--bitrate", str(mbit)]
-            cmd += NATIVE_TIERS.get(self.enhance[2].split(":")[-1], [])
+            parts = self.enhance[2].split(":")   # "native:<tier>[:fps2x]"
+            tier = parts[1] if len(parts) > 1 else "speed"
+            cmd += NATIVE_TIERS.get(tier, [])
+            if "fps2x" in parts:
+                cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps
             if sub_from > 0:
                 # Seek landed mid-segment: enhance only from that sub onward.
                 cmd += ["--start", str(sub_from * self.SUB_S)]
@@ -2170,10 +2174,17 @@ def main() -> int:
         vr_enhance = None
         if enh_native:
             ow, oh = enh_plan
-            vr_enhance = (ow, oh, "native:" + args.enhance)
+            # Auto frame interpolation: a <35fps source is doubled to ~60 so
+            # every tier targets 4K60 (measured: MetalFX/CuNNy 1.28x realtime,
+            # ArtCNN 46fps output). A source already >=50fps is left alone.
+            src_fps = float(vsrc.get("fps") or 30)
+            fps2x = src_fps < 35
+            mode_str = "native:" + args.enhance + (":fps2x" if fps2x else "")
+            vr_enhance = (ow, oh, mode_str)
             engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
             log(f"mode=remux+native-enhance {video.get('width')}x{video.get('height')}"
-                f"@{vsrc.get('fps') or 30} -> {ow}x{oh} {engine} zero-copy")
+                f"@{src_fps:g} -> {ow}x{oh}"
+                f"{'@60(interp)' if fps2x else ''} {engine} zero-copy")
         else:
             log(f"mode=remux {video.get('format_id')} {video.get('width')}x{video.get('height')} "
                 f"{video.get('vcodec')} + {audio.get('format_id')} -> fMP4 random-access")
