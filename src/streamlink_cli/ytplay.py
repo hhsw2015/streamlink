@@ -956,7 +956,7 @@ class VideoRemuxer:
             self.mp4_ts = self._mdhd_timescale(init)
             self._init_ready.set()
             with self.lock:
-                self._store(0, subs0)
+                self._store(0, self._patch_subs(subs0, self.segments[0][0]))
         except Exception as err:  # noqa: BLE001 - background thread boundary
             log("vremux bootstrap failed: " + repr(err))
         finally:
@@ -982,16 +982,20 @@ class VideoRemuxer:
                 return None
         return self.init_bytes
 
-    def _store(self, i: int, subs: list) -> None:
-        """Insert into the LRU under self.lock, evicting past the byte cap."""
+    def _store(self, i: int, subs: dict) -> None:
+        """Insert into the LRU under self.lock, evicting past the byte cap.
+
+        Values are {advertised_sub_index: bytes}; a partial production (seek
+        landed mid-segment) stores only the tail it produced.
+        """
         old = self.cache.pop(i, None)
         if old is not None:
-            self.cached_bytes -= sum(map(len, old))
+            self.cached_bytes -= sum(map(len, old.values()))
         self.cache[i] = subs
-        self.cached_bytes += sum(map(len, subs))
+        self.cached_bytes += sum(map(len, subs.values()))
         while self.cached_bytes > self.CACHE_BYTES and len(self.cache) > 1:
             _k, v = self.cache.popitem(last=False)
-            self.cached_bytes -= sum(map(len, v))
+            self.cached_bytes -= sum(map(len, v.values()))
 
     # -- webm parsing -------------------------------------------------------- #
     @staticmethod
@@ -1177,7 +1181,8 @@ class VideoRemuxer:
             self.gpu_proc = None
             self.gpu_cv.notify_all()
 
-    def _publish_partials(self, i: int, outd: str, stop: threading.Event):
+    def _publish_partials(self, i: int, outd: str, stop: threading.Event,
+                          sub_from: int = 0):
         """Poll vtenhance's output dir; publish finished sub-segments early.
 
         Runs while vtenhance enhances segment i. Each completed ~2s sub-segment
@@ -1209,9 +1214,10 @@ class VideoRemuxer:
                 if not sub:
                     break
                 local = self._read_tfdt(sub) / (ts or 90000)
-                patched = self._patch(sub, seg_start + local, ts=ts)
+                base_t = seg_start + sub_from * self.SUB_S
+                patched = self._patch(sub, base_t + local, ts=ts)
                 with self.pcond:
-                    self.partial.setdefault(i, []).append(patched)
+                    self.partial.setdefault(i, {})[sub_from + seen] = patched
                     self.pcond.notify_all()
                 seen += 1
             if stopped:
@@ -1233,7 +1239,12 @@ class VideoRemuxer:
         return max(1, int(self.segments[i][1] // self.SUB_S))
 
     def get_sub(self, i: int, m: int) -> bytes | None:
-        """Sub-segment m of segment i; serves early from partials during enhance."""
+        """Sub-segment m of segment i; serves early from partials during enhance.
+
+        A cold request with m > 0 (seek landed mid-segment) starts production
+        AT sub m (vtenhance --start): the player's first sub costs ~1 sub of
+        GPU work instead of enhancing the whole head of the segment first.
+        """
         if i < 0 or i >= len(self.segments):
             return None
         n = self.subcount(i)
@@ -1244,8 +1255,7 @@ class VideoRemuxer:
             cached = self.cache.get(i)
             producing = i in self.inflight
         if cached is None and not producing:
-            # kick off full-segment production (claims, fg priority, prefetch)
-            threading.Thread(target=self.get_segment, args=(i,), daemon=True).start()
+            threading.Thread(target=self._produce_from, args=(i, m), daemon=True).start()
         elif cached is not None:
             self._prefetch(i)
         deadline = time.time() + 120
@@ -1254,19 +1264,87 @@ class VideoRemuxer:
                 subs = self.cache.get(i)
                 if subs is not None:
                     self.cache.move_to_end(i)
+                    have_all_tail = all(k in subs for k in range(m, n))
             if subs is not None:
-                a = len(subs)
-                if m >= a:
-                    return None      # pathological undershoot: 404 this sub
-                return subs[m] if m < n - 1 else b"".join(subs[m:])
-            with self.pcond:
-                part = self.partial.get(i)
-                if part and len(part) > m and m < n - 1:
-                    return part[m]   # last advertised sub needs the full set
-                self.pcond.wait(0.5)
+                if m < n - 1 and m in subs:
+                    return subs[m]
+                if m == n - 1 and have_all_tail:
+                    # last advertised sub absorbs any extra actual subs
+                    return b"".join(subs[k] for k in sorted(subs) if k >= m)
+                # cached but this sub missing (partial store from a mid-segment
+                # production): produce the missing head, then loop re-checks
+                with self.lock:
+                    refill = i not in self.inflight
+                    if refill:
+                        rev = threading.Event()
+                        self.inflight[i] = rev
+                        self.started.add(i)
+                if refill:
+                    threading.Thread(target=self._refill, args=(i, rev),
+                                     daemon=True).start()
+                time.sleep(0.3)
+            else:
+                with self.pcond:
+                    part = self.partial.get(i)
+                    if part and m in part and m < n - 1:
+                        return part[m]
+                    self.pcond.wait(0.5)
         return None
 
-    def _remux(self, mini: bytes, seg_idx: int = -1):
+    def _produce_from(self, i: int, m: int):
+        """Foreground production starting at sub m (claims like get_segment)."""
+        with self.lock:
+            if i in self.cache or i in self.started:
+                return
+            ev = self.inflight.get(i)
+            if ev is None:
+                ev = threading.Event()
+                self.inflight[i] = ev
+            self.started.add(i)
+            self.gen += 1
+            self.fg_want.add(i)
+        try:
+            data = self._produce(i, chain=True, sub_from=m)
+            with self.lock:
+                existing = self.cache.get(i)
+                if existing:
+                    existing.update(data)
+                    data = existing
+                self._store(i, data)
+        except (RuntimeError, http.client.HTTPException, OSError) as err:
+            log(f"vremux seg {i}+{m} failed: {err!r}")
+        finally:
+            with self.lock:
+                self.fg_want.discard(i)
+                if self.inflight.get(i) is ev:
+                    self.inflight.pop(i)
+                self.started.discard(i)
+            with self.pcond:
+                self.partial.pop(i, None)
+                self.pcond.notify_all()
+            ev.set()
+
+    def _refill(self, i: int, ev: threading.Event):
+        """Produce the whole segment to fill head subs missing from a partial
+        (mid-segment) production; merges over what's cached."""
+        try:
+            data = self._produce(i, parallel=False)
+            with self.lock:
+                existing = self.cache.get(i) or {}
+                existing.update(data)
+                self._store(i, existing)
+        except (RuntimeError, http.client.HTTPException, OSError) as err:
+            log(f"vremux refill {i} failed: {err!r}")
+        finally:
+            with self.lock:
+                if self.inflight.get(i) is ev:
+                    self.inflight.pop(i)
+                self.started.discard(i)
+            with self.pcond:
+                self.pcond.notify_all()
+            ev.set()
+
+    def _remux(self, mini: bytes, seg_idx: int = -1, sub_from: int = 0):
         import tempfile
         d = tempfile.mkdtemp(prefix="seg-", dir=self._tmp)
         src = os.path.join(d, "in.webm")
@@ -1296,6 +1374,9 @@ class VideoRemuxer:
             cmd = [_vtenhance_path() or "vtenhance", frag, outd, "--hls",
                    "--seg-interval", str(self.SUB_S), "--scale", f"{ow}x{oh}",
                    "--bitrate", str(mbit)]
+            if sub_from > 0:
+                # Seek landed mid-segment: enhance only from that sub onward.
+                cmd += ["--start", str(sub_from * self.SUB_S)]
         elif self.enhance:
             # GPU upscale this segment (VideoToolbox decode -> Metal shader ->
             # VideoToolbox HEVC encode). Per-segment, so seeking anywhere only
@@ -1324,7 +1405,8 @@ class VideoRemuxer:
             pub = None
             if native and seg_idx >= 0:
                 pub = threading.Thread(target=self._publish_partials,
-                                       args=(seg_idx, outd, stop_pub), daemon=True)
+                                       args=(seg_idx, outd, stop_pub, sub_from),
+                                       daemon=True)
                 pub.start()
             try:
                 proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
@@ -1393,7 +1475,8 @@ class VideoRemuxer:
         return bytes(d)
 
     # -- public -------------------------------------------------------------- #
-    def _produce(self, i: int, parallel: bool = True, chain: bool = False) -> list:
+    def _produce(self, i: int, parallel: bool = True, chain: bool = False,
+                 sub_from: int = 0) -> dict:
         t0 = time.time()
         mini = self._mini(i, parallel=parallel)
         t_dl = time.time() - t0
@@ -1404,22 +1487,25 @@ class VideoRemuxer:
             # so prefetch can't cascade unbounded.
             self._prefetch(i)
         t1 = time.time()
-        init, subs = self._remux(mini, seg_idx=i)
+        init, subs = self._remux(mini, seg_idx=i, sub_from=sub_from)
         if self.enhance:
-            log(f"seg{i}: dl {t_dl:.1f}s gpu(wait+run) {time.time() - t1:.1f}s"
+            log(f"seg{i}{'+' + str(sub_from) if sub_from else ''}: dl {t_dl:.1f}s"
+                f" gpu(wait+run) {time.time() - t1:.1f}s"
                 f" ({len(mini) >> 20}MB, {'fg' if parallel else 'bg'})")
-        return self._patch_subs(subs, self.segments[i][0])
+        return self._patch_subs(subs, self.segments[i][0], sub_from)
 
-    def _patch_subs(self, subs: list, seg_start: float) -> list:
-        """tfdt-position each sub-segment at seg_start + its offset in the seg.
+    def _patch_subs(self, subs: list, seg_start: float, sub_from: int = 0) -> dict:
+        """tfdt-position sub-segments; returns {advertised_index: bytes}.
 
         Sub boundaries come from the subs' own baseMediaDecodeTime deltas
-        (vtenhance encodes from 0), so audio-video sync survives splitting.
+        (vtenhance encodes from 0, or from sub_from*SUB_S with --start),
+        so audio-video sync survives splitting.
         """
-        out = []
-        for sub in subs:
-            local = self._read_tfdt(sub) / self.mp4_ts  # seconds inside the seg
-            out.append(self._patch(sub, seg_start + local))
+        base_t = seg_start + sub_from * self.SUB_S
+        out = {}
+        for k, sub in enumerate(subs):
+            local = self._read_tfdt(sub) / self.mp4_ts  # seconds inside production
+            out[sub_from + k] = self._patch(sub, base_t + local)
         return out
 
     @staticmethod
@@ -1455,7 +1541,7 @@ class VideoRemuxer:
                     mine = False
         if mine is None:              # cache hit
             self._prefetch(i)         # (outside the lock: _prefetch takes it)
-            return b"".join(data)
+            return b"".join(data[k] for k in sorted(data))
         # The player is now blocked on segment i: give whichever job produces
         # it (this thread or a background one already running) GPU priority.
         with self.lock:
@@ -1465,12 +1551,13 @@ class VideoRemuxer:
                 ev.wait(timeout=120)
                 with self.lock:
                     got = self.cache.get(i)
-                    return b"".join(got) if got is not None else None
+                    return (b"".join(got[k] for k in sorted(got))
+                            if got is not None else None)
             try:
                 data = self._produce(i, chain=True)
                 with self.lock:
                     self._store(i, data)
-                return b"".join(data)
+                return b"".join(data[k] for k in sorted(data))
             except (RuntimeError, http.client.HTTPException, OSError) as err:
                 log(f"vremux seg {i} failed: {err!r}")
                 return None
