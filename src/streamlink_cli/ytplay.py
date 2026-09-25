@@ -1399,6 +1399,8 @@ class VideoRemuxer:
             cmd += NATIVE_TIERS.get(tier, [])
             if "fps2x" in parts:
                 cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps
+            if getattr(self, "muxed", False):
+                cmd += ["--audio"]               # muxed source: keep its audio
             if sub_from > 0:
                 # Seek landed mid-segment: enhance only from that sub onward.
                 cmd += ["--start", str(sub_from * self.SUB_S)]
@@ -1705,6 +1707,56 @@ class SidxRemuxer(VideoRemuxer):
         a, b = self.seg_ranges[i]
         body = self._fetch_parallel(a, b) if parallel else self.up.fetch_range(a, b)
         return self.sidx_init + body
+
+
+class HlsRemuxer(VideoRemuxer):
+    """Native enhance for MUXED HLS sources (segments carry A+V in one file).
+
+    Segments come from an HLS media playlist (URLs, not byte ranges); each is
+    fed to vtenhance with --audio so the enhanced output keeps its sound. A
+    fMP4 playlist's EXT-X-MAP init is prepended; TS segments are self-contained.
+    """
+    SRC_NAME = "insrc.mp4"
+    muxed = True              # _remux passes --audio; served as one A+V variant
+
+    def _build_index(self, duration: float):
+        proxy = self.up.proxy.geturl() if self.up.proxy else None
+        hdrs = {k: v for k, v in self.up.headers.items() if k != "User-Agent"}
+        self._hls = HlsFetcher(proxy, hdrs)
+        base = self.up.url
+        text = self._hls.open(base).read().decode("utf-8", "replace")
+        init_url = None
+        seg_urls: list[str] = []
+        durs: list[float] = []
+        pending: float | None = None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("#EXT-X-MAP:"):
+                m = re.search(r'URI="([^"]+)"', line)
+                if m:
+                    init_url = urllib.parse.urljoin(base, m.group(1))
+            elif line.startswith("#EXTINF:"):
+                try:
+                    pending = float(line[8:].split(",")[0])
+                except ValueError:
+                    pending = 2.0
+            elif line and not line.startswith("#"):
+                seg_urls.append(urllib.parse.urljoin(base, line))
+                durs.append(pending or 2.0)
+                pending = None
+        if not seg_urls:
+            raise RuntimeError("HLS media playlist has no segments")
+        self._seg_urls = seg_urls
+        self._src_init = self._hls.open(init_url).read() if init_url else b""
+        starts, t = [], 0.0
+        for d in durs:
+            starts.append(t)
+            t += d
+        self.segments = [(starts[i], max(0.001, durs[i])) for i in range(len(seg_urls))]
+        self.total = 0
+
+    def _mini(self, i: int, parallel: bool = True) -> bytes:
+        return self._src_init + self._hls.open(self._seg_urls[i]).read()
 
 
 class EnhancePipe:
@@ -2185,8 +2237,11 @@ def main() -> int:
     # Other modes (progressive/hls) still fall back to the sequential pipe.
     enh_native = bool(enh_plan and enh_native_bin
                       and info.get("mode") in ("remux", "sidx"))
+    # Muxed HLS (single A+V rendition): native via HlsRemuxer, segments keep
+    # their own audio (vtenhance --audio), served as one variant.
+    enh_native_muxed = bool(enh_plan and enh_native_bin and info.get("mode") == "hls")
 
-    if enh_plan is not None and not enh_native:
+    if enh_plan is not None and not enh_native and not enh_native_muxed:
         ow, oh = enh_plan
         fpsv = vsrc.get("fps") or 30
         log(f"mode=enhance {vsrc.get('width')}x{vsrc.get('height')}@{fpsv} -> {ow}x{oh} CuNNy")
@@ -2205,7 +2260,7 @@ def main() -> int:
             pipe.cleanup()
             enh_plan = None
 
-    if enh_plan is not None and not enh_native:
+    if enh_plan is not None and not enh_native and not enh_native_muxed:
         pass  # enhance path set entry above; skip source-mode dispatch
     elif info["mode"] == "remux" or (enh_native and info["mode"] == "sidx"):
         # Native random-access enhance path, shared by two source shapes:
@@ -2352,6 +2407,39 @@ def main() -> int:
         }
         entry = "/master.m3u8"
         quality_note = f"{video.get('height')}p {vcodec.split('.')[0]} HLS"
+
+    elif enh_native_muxed and info["mode"] == "hls":
+        # Muxed HLS + native enhance: each segment (A+V) runs through vtenhance
+        # --audio; served as one variant (no separate audio rendition).
+        media = info["media"]
+        ow, oh = enh_plan
+        src_fps = float(media.get("fps") or 30)
+        fps2x = src_fps < 35
+        mode_str = "native:" + args.enhance + (":fps2x" if fps2x else "")
+        engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
+        log(f"mode=hls+native-enhance {media.get('width')}x{media.get('height')}"
+            f"@{src_fps:g} -> {ow}x{oh}{'@60(interp)' if fps2x else ''} {engine} muxed")
+        try:
+            remux = HlsRemuxer(media["url"], proxy, media.get("http_headers"),
+                               info.get("duration") or 0, (ow, oh, mode_str))
+        except Exception as err:
+            log("hls native setup failed: " + repr(err))
+            notify_mac("ytplay failed", "hls native: " + str(err)[:80])
+            return 1
+        mvid = dict(media, vcodec="hvc1.2.4.L153.B0", width=ow, height=oh)
+        bandwidth = int((media.get("tbr") or 6000) * 1000)
+        playlists = {
+            "/master.m3u8": "\n".join([
+                "#EXTM3U",
+                f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},'
+                f'CODECS="hvc1.2.4.L153.B0,mp4a.40.2",'
+                f'RESOLUTION={ow}x{oh}',
+                "v.m3u8",
+            ]) + "\n",
+            "/v.m3u8": remux.video_playlist().decode(),
+        }
+        entry = "/master.m3u8"
+        quality_note = f"{oh}p enhanced (native muxed)"
 
     elif info["mode"] == "hls":
         media = info["media"]
