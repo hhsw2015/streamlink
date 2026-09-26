@@ -167,17 +167,19 @@ ENHANCE_MPX_METALFX = 550_000_000
 NATIVE_TIERS = {"speed": [], "quality": ["--cunny"], "max": ["--artcnn"]}
 
 
-def _ane_model_path(height: int) -> str | None:
+def _ane_model_path(height: int, f32: bool = False) -> str | None:
     """Precompiled CoreML SR model matching the source height (ANE offload).
 
     The ANE runs ArtCNN ~1.5x faster than the GPU AND frees the GPU for
-    FRC/encode - max tier uses it whenever a matching model exists.
+    FRC/encode - max tier uses it whenever a matching model exists. f32=True
+    picks the heavier C4F32 variant (sharper; fits 4K30 at ~45fps on the ANE,
+    so only for <=48fps sources - 60fps needs C4F16's speed for 4K60).
     """
     for base in (os.environ.get("YTPLAY_ANE_MODELS"),
                  os.path.expanduser("~/Dev/metalenhance/models")):
         if not base:
             continue
-        c = os.path.join(base, f"artcnn{height}.mlmodelc")
+        c = os.path.join(base, f"artcnn{height}{'_f32' if f32 else ''}.mlmodelc")
         if os.path.exists(c):
             return c
     return None
@@ -1494,7 +1496,9 @@ class VideoRemuxer:
             tier = parts[1] if len(parts) > 1 else "speed"
             ane_model = None
             for pt in parts:
-                if pt.startswith("ane"):
+                if pt.startswith("anef"):          # heavier C4F32 variant
+                    ane_model = _ane_model_path(int(pt[4:]), f32=True)
+                elif pt.startswith("ane"):
                     ane_model = _ane_model_path(int(pt[3:]))
             if tier == "max" and ane_model:
                 # ArtCNN on the Neural Engine (faster than GPU + frees the GPU
@@ -2645,9 +2649,13 @@ def main() -> int:
             dn = _denoise_strength(vsrc) if args.enhance in ("quality", "max") else 0.0
             src_h = int(vsrc.get("height") or 0)
             ane = args.enhance == "max" and _ane_model_path(src_h) is not None
+            # Heavier C4F32 when it fits 4K30 (<=48fps, no interp) - sharper, uses
+            # the ANE headroom C4F16 left idle; 60fps stays C4F16 for 4K60.
+            ane_f32 = (ane and not fps2x and src_fps <= 48
+                       and _ane_model_path(src_h, f32=True) is not None)
             mode_str = ("native:" + args.enhance + (":fps2x" if fps2x else "")
                         + (f":dn{dn:.3f}" if dn > 0 else "")
-                        + (f":ane{src_h}" if ane else ""))
+                        + (f":anef{src_h}" if ane_f32 else (f":ane{src_h}" if ane else "")))
             vr_enhance = (ow, oh, mode_str)
             engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
             log(f"mode={info['mode']}+native-enhance {video.get('width')}x{video.get('height')}"
@@ -2787,9 +2795,11 @@ def main() -> int:
         dn = _denoise_strength(media) if args.enhance in ("quality", "max") else 0.0
         src_h = int(media.get("height") or 0)
         ane = args.enhance == "max" and _ane_model_path(src_h) is not None
+        ane_f32 = (ane and not fps2x and src_fps <= 48
+                   and _ane_model_path(src_h, f32=True) is not None)
         mode_str = ("native:" + args.enhance + (":fps2x" if fps2x else "")
                     + (f":dn{dn:.3f}" if dn > 0 else "")
-                    + (f":ane{src_h}" if ane else ""))
+                    + (f":anef{src_h}" if ane_f32 else (f":ane{src_h}" if ane else "")))
         engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
         log(f"mode=hls+native-enhance {media.get('width')}x{media.get('height')}"
             f"@{src_fps:g} -> {ow}x{oh}{'@60(interp)' if fps2x else ''} {engine} muxed")
