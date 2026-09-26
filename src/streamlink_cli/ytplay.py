@@ -192,9 +192,9 @@ def _denoise_strength(src: dict) -> float:
     eff = 2.5 if (vc.startswith("vp9") or vc.startswith("vp09")
                   or vc.startswith("av01")) else 1.0
     ebpp = bpp * eff
-    if ebpp < 0.05:
+    if ebpp < 0.035:      # truly starved (PH h264 ~2Mbps: 0.032)
         return 0.06
-    if ebpp < 0.08:
+    if ebpp < 0.06:       # soft (YT vp9 1080p60 ~2.1Mbps: 0.043)
         return 0.03
     return 0.0
 
