@@ -185,10 +185,17 @@ def _denoise_strength(src: dict) -> float:
     if w <= 0 or h <= 0 or tbr <= 0:
         return 0.0
     bpp = (tbr * 1000.0) / (w * h * max(fps, 1.0))
-    if bpp < 0.05:        # e.g. PornHub 1080p30 @~2Mbps ~= 0.032
+    # Codec efficiency: vp9/av1 deliver ~2x h264 quality per bit, so their
+    # artifact threshold sits at roughly half the bpp (YT vp9 1080p60 at
+    # bpp ~0.023 is clean; PH h264 1080p30 at ~0.032 is blocky).
+    vc = str(src.get("vcodec") or "").lower()
+    eff = 2.5 if (vc.startswith("vp9") or vc.startswith("vp09")
+                  or vc.startswith("av01")) else 1.0
+    ebpp = bpp * eff
+    if ebpp < 0.05:
         return 0.06
-    if bpp < 0.09:
-        return 0.04
+    if ebpp < 0.08:
+        return 0.03
     return 0.0
 
 
@@ -964,6 +971,7 @@ class VideoRemuxer:
         # seek all come free from this class, so enhanced playback seeks like
         # raw does (per-segment on demand) instead of a sequential transcode.
         self.enhance = enhance
+        self.src_fps = 30.0       # source framerate; dispatch sites overwrite
         # One GPU job at a time: concurrent vtenhance/ffmpeg runs would split
         # the shared hardware encoder and all finish late. The GPU always goes
         # to the waiter CLOSEST TO THE PLAYHEAD (lowest segment index, fg_want
@@ -1474,9 +1482,12 @@ class VideoRemuxer:
             for pt in parts:
                 if pt.startswith("dn"):
                     cmd += ["--denoise", pt[2:]]  # pre-upscale bilateral denoise
-            if "fps2x" not in parts:
-                # No interpolation = GPU has spare margin -> spend it on a
-                # higher-quality encode (better retention of the CNN's detail).
+            # --hq (slower, better encode) only when the OUTPUT framerate
+            # leaves real GPU margin: hq encodes ~51fps at 4K, so a 60fps
+            # output (60fps source, or 30fps+fps2x) can't afford it - it
+            # would fall below realtime and stall. 4K30 output can.
+            out_fps = self.src_fps * (2 if "fps2x" in parts else 1)
+            if out_fps <= 40:
                 cmd += ["--hq"]
             # (muxed sources serve audio as a SEPARATE rendition - SenPlayer
             # only plays EXT-X-MEDIA audio, not audio muxed in the variant - so
@@ -2602,6 +2613,8 @@ def main() -> int:
                 a_future = pool.submit(parse_sidx, a_up)
                 remux = r_future.result(timeout=90)
                 a_init, a_segs = a_future.result(timeout=90)
+            if enh_native:
+                remux.src_fps = src_fps
         except Exception as err:
             log("remux setup failed: " + repr(err))
             notify_mac("ytplay failed", "remux setup: " + str(err)[:80])
@@ -2728,6 +2741,7 @@ def main() -> int:
         try:
             remux = HlsRemuxer(media["url"], proxy, media.get("http_headers"),
                                info.get("duration") or 0, (ow, oh, mode_str))
+            remux.src_fps = src_fps
         except Exception as err:
             log("hls native setup failed: " + repr(err))
             notify_mac("ytplay failed", "hls native: " + str(err)[:80])
