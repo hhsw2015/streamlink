@@ -1525,12 +1525,13 @@ class VideoRemuxer:
             if (has_temporal and "fps2x" not in parts
                     and (tier == "quality" or (tier == "max" and ane_model))):
                 cmd += ["--dense-flow"]
-            # --hq (slower, better encode) whenever measured margin allows:
-            #   quality/CuNNy+fps2x with hq = 51.6fps -> only safe for <=48 out
-            #   plain 4K30 with hq = 50.8fps -> fine
-            #   max/ANE: hq is free (ANE-bound, 39fps either way) -> always
+            # --hq (slower, better encode) only at <=48fps output. It's NOT free
+            # on the ANE tier as once assumed: at 4K it caps the media engine at
+            # ~48fps (C4F16 plain 69 -> hq 48), so forcing it at 4K60 buffered.
+            # And it only buys ~+0.5dB on an already-transparent 25Mbps encode,
+            # so 4K60 skips it and runs plain at ~69fps.
             out_fps = self.src_fps * (2 if "fps2x" in parts else 1)
-            if ane_model or out_fps <= 48:
+            if out_fps <= 40:      # hq caps ~48fps at 4K; keep margin (24/25/30)
                 cmd += ["--hq"]
             # (muxed sources serve audio as a SEPARATE rendition - SenPlayer
             # only plays EXT-X-MEDIA audio, not audio muxed in the variant - so
@@ -2646,12 +2647,18 @@ def main() -> int:
                 # not streamable), but a native 60fps source runs ArtCNN-ANE
                 # at 4K60 fine (69fps, 1.15x). 30fps sources stay 4K30.
                 fps2x = False
-            dn = _denoise_strength(vsrc) if args.enhance in ("quality", "max") else 0.0
+            # Temporal + dense-flow (2-iter GPU flow) fits 4K60 on the MAX tier
+            # (ANE CNN runs parallel to GPU flow: ~68fps) but not the quality tier
+            # (CuNNy + flow both on the GPU: ~50fps). Gate per tier so neither
+            # buffers; max keeps its denoise even at 60fps.
+            _temporal_ok = src_fps <= (61 if args.enhance == "max" else 35)
+            dn = (_denoise_strength(vsrc)
+                  if (args.enhance in ("quality", "max") and _temporal_ok) else 0.0)
             src_h = int(vsrc.get("height") or 0)
             ane = args.enhance == "max" and _ane_model_path(src_h) is not None
-            # Heavier C4F32 when it fits 4K30 (<=48fps, no interp) - sharper, uses
-            # the ANE headroom C4F16 left idle; 60fps stays C4F16 for 4K60.
-            ane_f32 = (ane and not fps2x and src_fps <= 48
+            # Heavier C4F32 only for CLEAN low-fps sources (margin to spare);
+            # compressed ones use C4F16 + temporal, 48/60fps use C4F16 for 4K60.
+            ane_f32 = (ane and not fps2x and dn <= 0 and src_fps <= 35
                        and _ane_model_path(src_h, f32=True) is not None)
             mode_str = ("native:" + args.enhance + (":fps2x" if fps2x else "")
                         + (f":dn{dn:.3f}" if dn > 0 else "")
@@ -2792,10 +2799,14 @@ def main() -> int:
         ow, oh = enh_plan
         src_fps = float(media.get("fps") or 30)
         fps2x = src_fps < 35
-        dn = _denoise_strength(media) if args.enhance in ("quality", "max") else 0.0
+        # Temporal fits 4K60 on the max tier (ANE CNN || GPU flow) but not quality
+        # (both on GPU). Gate per tier so neither buffers; max keeps denoise @60.
+        _temporal_ok = src_fps <= (61 if args.enhance == "max" else 35)
+        dn = (_denoise_strength(media)
+              if (args.enhance in ("quality", "max") and _temporal_ok) else 0.0)
         src_h = int(media.get("height") or 0)
         ane = args.enhance == "max" and _ane_model_path(src_h) is not None
-        ane_f32 = (ane and not fps2x and src_fps <= 48
+        ane_f32 = (ane and not fps2x and dn <= 0 and src_fps <= 35
                    and _ane_model_path(src_h, f32=True) is not None)
         mode_str = ("native:" + args.enhance + (":fps2x" if fps2x else "")
                     + (f":dn{dn:.3f}" if dn > 0 else "")
