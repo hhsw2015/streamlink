@@ -19,6 +19,9 @@ const QUALITIES = ["best", "2160p", "1440p", "1080p", "720p", "480p", "360p"];
 const DEFAULT_PLAYER_ID = "iina";
 const DEFAULT_QUALITY = "best";
 
+// Friendly names for the enhance tiers, shared by the menu and the toasts.
+const ENH_NAME = { off: "关闭", speed: "速度", quality: "质量", max: "极限" };
+
 async function rebuildMenus() {
   await chrome.contextMenus.removeAll();
   // ytplay: the primary path. yt-dlp pipeline — any site, max quality, full seek.
@@ -50,10 +53,14 @@ async function rebuildMenus() {
       });
     }
   }
-  // Enhance selector: GPU AI upscale in the local pipeline before the stream
-  // reaches the player. Any yt-dlp site. Two backends, each best in its niche
-  // on Apple Silicon (measured): MetalFX guarantees 4K60; CuNNy is the quality
-  // ceiling but auto-caps resolution to stay realtime.
+  // Enhance selector: local GPU/ANE AI upscale before the stream reaches the
+  // player. Any yt-dlp site. Three tiers on Apple Silicon (measured):
+  //   speed   = MetalFX, guaranteed 4K60, smoothest (any content).
+  //   quality = CuNNy CNN super-res, solid 4K60 (clean sources).
+  //   max     = ArtCNN on the Neural Engine + motion-compensated multi-frame
+  //             temporal reconstruction. Recovers real detail and denoises
+  //             compressed/low-bitrate web video (+3dB luma, +0.7dB chroma);
+  //             heaviest, so 4K30 for 30fps input (4K60 for 60fps sources).
   const { enhanceMode } = await chrome.storage.local.get({ enhanceMode: "off" });
   chrome.contextMenus.create({
     id: "sl-enhance-menu",
@@ -62,9 +69,9 @@ async function rebuildMenus() {
   });
   const ENH = [
     ["off", "关闭"],
-    ["speed", "速度 (MetalFX, 最流畅)"],
-    ["quality", "质量 (CuNNy AI 超分)"],
-    ["max", "极限画质 (ArtCNN, 最强细节)"],
+    ["speed", "速度 · MetalFX · 稳 4K60,最流畅"],
+    ["quality", "质量 · CuNNy AI 超分 · 4K60"],
+    ["max", "极限 · ArtCNN(神经引擎)+时域重建 · 压缩/低清源最佳 (4K30)"],
   ];
   for (const [mode, label] of ENH) {
     chrome.contextMenus.create({
@@ -96,7 +103,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (enhMatch && enhMatch[1] !== "menu") {
     const mode = enhMatch[1];
     await chrome.storage.local.set({ enhanceMode: mode });
-    notify("画质增强: " + (mode === "off" ? "已关闭" : mode + " 已开启 ✨"), "Local");
+    notify("画质增强: " + (mode === "off" ? "已关闭" : (ENH_NAME[mode] || mode) + " 已开启 ✨"), "Local");
     return;
   }
 
@@ -112,7 +119,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const player = PLAYERS.find((p) => p.id === playerId);
     const { enhanceMode } = await chrome.storage.local.get({ enhanceMode: "off" });
     const enhance = enhanceMode !== "off" ? enhanceMode : "";
-    notify(player.name + " " + quality + (enhance ? " ✨" + enhance : "") + " → resolving (ytplay)", "Local");
+    notify(player.name + " " + quality + (enhance ? " ✨" + (ENH_NAME[enhance] || enhance) : "") + " → resolving (ytplay)", "Local");
     const cookies = await collectCookies(url);
     const payload = {
       engine: "ytplay",
@@ -120,7 +127,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       quality,
       scheme: playerId,   // ytplay knows senplayer/iina by name
       cookies,
-      enhance,            // "" | "2x"
+      enhance,            // "" | "speed" | "quality" | "max"
     };
     return sendToHost(payload, player, quality, "Local");
   }
