@@ -2620,6 +2620,16 @@ def main() -> int:
             # ArtCNN 46fps output). A source already >=50fps is left alone.
             src_fps = float(vsrc.get("fps") or 30)
             fps2x = src_fps < 35
+        if args.enhance == "max":
+            # ArtCNN 4K60 (mixed ANE+GPU) measured 0.81x realtime - not
+            # streamable. max = best per-frame quality at a solid 4K30
+            # (ANE 69fps, 2.3x); 60fps seekers use quality (CuNNy 4K60).
+            fps2x = False
+            if args.enhance == "max":
+                # ArtCNN 4K60 (mixed ANE+GPU) measured 0.81x realtime - not
+                # streamable. max = best per-frame quality at a solid 4K30
+                # (ANE 69fps, 2.3x); 60fps seekers use quality (CuNNy 4K60).
+                fps2x = False
             dn = _denoise_strength(vsrc) if args.enhance in ("quality", "max") else 0.0
             src_h = int(vsrc.get("height") or 0)
             ane = args.enhance == "max" and _ane_model_path(src_h) is not None
