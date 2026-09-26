@@ -1506,7 +1506,9 @@ class VideoRemuxer:
                 cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps
             for pt in parts:
                 if pt.startswith("dn"):
-                    cmd += ["--denoise", pt[2:]]  # pre-upscale bilateral denoise
+                    # compressed source: spatial denoise + temporal accumulation
+                    # (cross-frame signal recovery; motion-gated, no ghosting)
+                    cmd += ["--denoise", pt[2:], "--temporal", "0.7"]
             # --hq (slower, better encode) only when the OUTPUT framerate
             # leaves real GPU margin: hq encodes ~51fps at 4K, so a 60fps
             # output (60fps source, or 30fps+fps2x) can't afford it - it
