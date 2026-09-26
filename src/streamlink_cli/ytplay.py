@@ -1511,13 +1511,15 @@ class VideoRemuxer:
                     # (cross-frame signal recovery; motion-gated, no ghosting)
                     cmd += ["--denoise", pt[2:], "--temporal", "0.7"]
                     has_temporal = True
-            # Dense GPU optical flow for the MC temporal warp: only the max/ANE
-            # tier (GPU is idle there - the CNN runs on the ANE) and only without
-            # fps2x (matches vtenhance's !fps2x MC path). A full-res field aligns
-            # moving regions the coarse 240x135 hw flow couldn't, AND moves flow
-            # off the media engine so it stops contending with the HEVC encoder:
-            # measured 4K30 36 -> 47fps, warped residual 61% -> ~10%.
-            if has_temporal and tier == "max" and ane_model and "fps2x" not in parts:
+            # Dense GPU optical flow for the MC temporal warp - BOTH CNN tiers,
+            # not fps2x (matches vtenhance's !fps2x MC path). A full-res field
+            # aligns moving regions the coarse 240x135 hw flow couldn't and takes
+            # flow off the media engine. quality/CuNNy has GPU headroom, so it
+            # costs only ~2fps for +2.3dB static / less motion ghosting; max/ANE
+            # gets it free (GPU idle - the CNN runs on the ANE). Skipped only for
+            # a GPU-ArtCNN max fallback (no ANE model) where the GPU is saturated.
+            if (has_temporal and "fps2x" not in parts
+                    and (tier == "quality" or (tier == "max" and ane_model))):
                 cmd += ["--dense-flow"]
             # --hq (slower, better encode) whenever measured margin allows:
             #   quality/CuNNy+fps2x with hq = 51.6fps -> only safe for <=48 out

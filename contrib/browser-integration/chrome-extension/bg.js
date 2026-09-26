@@ -55,12 +55,13 @@ async function rebuildMenus() {
   }
   // Enhance selector: local GPU/ANE AI upscale before the stream reaches the
   // player. Any yt-dlp site. Three tiers on Apple Silicon (measured):
-  //   speed   = MetalFX, guaranteed 4K60, smoothest (any content).
-  //   quality = CuNNy CNN super-res, solid 4K60 (clean sources).
-  //   max     = ArtCNN on the Neural Engine + motion-compensated multi-frame
-  //             temporal reconstruction. Recovers real detail and denoises
-  //             compressed/low-bitrate web video (+3dB luma, +0.7dB chroma);
-  //             heaviest, so 4K30 for 30fps input (4K60 for 60fps sources).
+  //   speed   = MetalFX, guaranteed 4K60, smoothest (no CNN, no temporal).
+  //   quality = CuNNy CNN super-res + motion-compensated temporal reconstruction.
+  //   max     = ArtCNN on the Neural Engine (heaviest, most detail) + the same
+  //             temporal reconstruction.
+  // BOTH CNN tiers denoise/recover compressed sources (dense GPU optical flow +
+  // multi-frame merge, +2-3dB luma): they differ in the SR model, not the
+  // temporal stage. Clean sources run 4K60; temporal (compressed) settles ~4K30.
   const { enhanceMode } = await chrome.storage.local.get({ enhanceMode: "off" });
   chrome.contextMenus.create({
     id: "sl-enhance-menu",
@@ -70,8 +71,8 @@ async function rebuildMenus() {
   const ENH = [
     ["off", "关闭"],
     ["speed", "速度 · MetalFX · 稳 4K60,最流畅"],
-    ["quality", "质量 · CuNNy AI 超分 · 4K60"],
-    ["max", "极限 · ArtCNN(神经引擎)+时域重建 · 压缩/低清源最佳 (4K30)"],
+    ["quality", "质量 · CuNNy 超分 + 时域重建"],
+    ["max", "极限 · ArtCNN 超分(神经引擎)+ 时域重建,细节最强"],
   ];
   for (const [mode, label] of ENH) {
     chrome.contextMenus.create({
