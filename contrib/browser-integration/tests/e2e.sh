@@ -3,9 +3,11 @@
 #
 # Runs, in order:
 #   1. Python unit tests for the savenow plugin (pytest)
-#   2. Extension canonCloudQuality parity vs Python (node)
-#   3. Native-messaging host protocol round-trip (python)
-#   4. Cloud extractor live smoke (python + urllib)
+#   2. Native-messaging host protocol round-trip (python)
+#   3. Cloud extractor live smoke (python + urllib)
+#
+# (The old extension canonCloudQuality parity check was dropped: the extension
+#  no longer does cloud quality canon - bg.js is ytplay-only now.)
 #
 # Exit code 0 = everything green. Any red = non-zero.
 #
@@ -27,7 +29,7 @@ fi
 echo "==> using PY=$PY"
 
 echo
-echo "==> 1/4 pytest tests/plugins/test_savenow.py"
+echo "==> 1/3 pytest tests/plugins/test_savenow.py"
 if [[ -n "${PYTEST:-}" ]]; then
   (cd "$REPO" && "$PYTEST" tests/plugins/test_savenow.py -x -q)
 else
@@ -35,19 +37,11 @@ else
 fi
 
 echo
-echo "==> 2/4 node extension_canon.mjs"
-if command -v node >/dev/null 2>&1; then
-  node "$HERE/extension_canon.mjs"
-else
-  echo "  [SKIP] node not installed"
-fi
-
-echo
-echo "==> 3/4 python native_host_protocol.py"
+echo "==> 2/3 python native_host_protocol.py"
 "$PY" "$HERE/native_host_protocol.py"
 
 echo
-echo "==> 4/4 python cloud_live.py"
+echo "==> 3/3 python cloud_live.py"
 "$PY" "$HERE/cloud_live.py"
 
 echo
