@@ -1504,11 +1504,21 @@ class VideoRemuxer:
                 cmd += NATIVE_TIERS.get(tier, [])
             if "fps2x" in parts:
                 cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps
+            has_temporal = False
             for pt in parts:
                 if pt.startswith("dn"):
                     # compressed source: spatial denoise + temporal accumulation
                     # (cross-frame signal recovery; motion-gated, no ghosting)
                     cmd += ["--denoise", pt[2:], "--temporal", "0.7"]
+                    has_temporal = True
+            # Dense GPU optical flow for the MC temporal warp: only the max/ANE
+            # tier (GPU is idle there - the CNN runs on the ANE) and only without
+            # fps2x (matches vtenhance's !fps2x MC path). A full-res field aligns
+            # moving regions the coarse 240x135 hw flow couldn't, AND moves flow
+            # off the media engine so it stops contending with the HEVC encoder:
+            # measured 4K30 36 -> 47fps, warped residual 61% -> ~10%.
+            if has_temporal and tier == "max" and ane_model and "fps2x" not in parts:
+                cmd += ["--dense-flow"]
             # --hq (slower, better encode) whenever measured margin allows:
             #   quality/CuNNy+fps2x with hq = 51.6fps -> only safe for <=48 out
             #   plain 4K30 with hq = 50.8fps -> fine
