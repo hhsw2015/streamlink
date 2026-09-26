@@ -1509,12 +1509,12 @@ class VideoRemuxer:
                     # compressed source: spatial denoise + temporal accumulation
                     # (cross-frame signal recovery; motion-gated, no ghosting)
                     cmd += ["--denoise", pt[2:], "--temporal", "0.7"]
-            # --hq (slower, better encode) only when the OUTPUT framerate
-            # leaves real GPU margin: hq encodes ~51fps at 4K, so a 60fps
-            # output (60fps source, or 30fps+fps2x) can't afford it - it
-            # would fall below realtime and stall. 4K30 output can.
+            # --hq (slower, better encode) whenever measured margin allows:
+            #   quality/CuNNy+fps2x with hq = 51.6fps -> only safe for <=48 out
+            #   plain 4K30 with hq = 50.8fps -> fine
+            #   max/ANE: hq is free (ANE-bound, 39fps either way) -> always
             out_fps = self.src_fps * (2 if "fps2x" in parts else 1)
-            if out_fps <= 40:
+            if ane_model or out_fps <= 48:
                 cmd += ["--hq"]
             # (muxed sources serve audio as a SEPARATE rendition - SenPlayer
             # only plays EXT-X-MEDIA audio, not audio muxed in the variant - so
