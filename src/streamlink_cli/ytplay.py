@@ -167,6 +167,22 @@ ENHANCE_MPX_METALFX = 550_000_000
 NATIVE_TIERS = {"speed": [], "quality": ["--cunny"], "max": ["--artcnn"]}
 
 
+def _ane_model_path(height: int) -> str | None:
+    """Precompiled CoreML SR model matching the source height (ANE offload).
+
+    The ANE runs ArtCNN ~1.5x faster than the GPU AND frees the GPU for
+    FRC/encode - max tier uses it whenever a matching model exists.
+    """
+    for base in (os.environ.get("YTPLAY_ANE_MODELS"),
+                 os.path.expanduser("~/Dev/metalenhance/models")):
+        if not base:
+            continue
+        c = os.path.join(base, f"artcnn{height}.mlmodelc")
+        if os.path.exists(c):
+            return c
+    return None
+
+
 def _denoise_strength(src: dict) -> float:
     """Bilateral luma denoise strength from source bits-per-pixel.
 
@@ -1474,9 +1490,18 @@ class VideoRemuxer:
             cmd = [_vtenhance_path() or "vtenhance", frag, outd, "--hls",
                    "--seg-interval", str(self.SUB_S), "--scale", f"{ow}x{oh}",
                    "--bitrate", str(mbit)]
-            parts = self.enhance[2].split(":")   # "native:<tier>[:fps2x]"
+            parts = self.enhance[2].split(":")   # "native:<tier>[:fps2x][:dnN][:aneH]"
             tier = parts[1] if len(parts) > 1 else "speed"
-            cmd += NATIVE_TIERS.get(tier, [])
+            ane_model = None
+            for pt in parts:
+                if pt.startswith("ane"):
+                    ane_model = _ane_model_path(int(pt[3:]))
+            if tier == "max" and ane_model:
+                # ArtCNN on the Neural Engine (faster than GPU + frees the GPU
+                # for FRC/encode). --cunny still loads the chroma kernel.
+                cmd += ["--cunny", "--ane", ane_model]
+            else:
+                cmd += NATIVE_TIERS.get(tier, [])
             if "fps2x" in parts:
                 cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps
             for pt in parts:
@@ -2594,8 +2619,11 @@ def main() -> int:
             src_fps = float(vsrc.get("fps") or 30)
             fps2x = src_fps < 35
             dn = _denoise_strength(vsrc) if args.enhance in ("quality", "max") else 0.0
+            src_h = int(vsrc.get("height") or 0)
+            ane = args.enhance == "max" and _ane_model_path(src_h) is not None
             mode_str = ("native:" + args.enhance + (":fps2x" if fps2x else "")
-                        + (f":dn{dn:.3f}" if dn > 0 else ""))
+                        + (f":dn{dn:.3f}" if dn > 0 else "")
+                        + (f":ane{src_h}" if ane else ""))
             vr_enhance = (ow, oh, mode_str)
             engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
             log(f"mode={info['mode']}+native-enhance {video.get('width')}x{video.get('height')}"
@@ -2733,8 +2761,11 @@ def main() -> int:
         src_fps = float(media.get("fps") or 30)
         fps2x = src_fps < 35
         dn = _denoise_strength(media) if args.enhance in ("quality", "max") else 0.0
+        src_h = int(media.get("height") or 0)
+        ane = args.enhance == "max" and _ane_model_path(src_h) is not None
         mode_str = ("native:" + args.enhance + (":fps2x" if fps2x else "")
-                    + (f":dn{dn:.3f}" if dn > 0 else ""))
+                    + (f":dn{dn:.3f}" if dn > 0 else "")
+                    + (f":ane{src_h}" if ane else ""))
         engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
         log(f"mode=hls+native-enhance {media.get('width')}x{media.get('height')}"
             f"@{src_fps:g} -> {ow}x{oh}{'@60(interp)' if fps2x else ''} {engine} muxed")
