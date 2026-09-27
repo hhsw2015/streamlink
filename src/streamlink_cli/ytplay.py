@@ -2274,6 +2274,145 @@ class EnhancePipe:
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
+def _ffprobe_props(path: str) -> tuple[int, int, float, float]:
+    """(width, height, fps, duration) of a local media file via ffprobe."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate",
+             "-show_entries", "format=duration", "-of", "json", path],
+            capture_output=True, text=True, timeout=30).stdout
+        d = json.loads(out)
+        s = (d.get("streams") or [{}])[0]
+        w, h = int(s.get("width") or 0), int(s.get("height") or 0)
+        num, _, den = (s.get("r_frame_rate") or "30/1").partition("/")
+        fps = (float(num) / float(den)) if den and float(den) else 30.0
+        dur = float((d.get("format") or {}).get("duration") or 0)
+        return w, h, fps, dur
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        return 0, 0, 30.0, 0.0
+
+
+def _vt_tier_flags(enhance: str, src_h: int) -> list[str]:
+    """vtenhance flags for a tier on a local file (SR only - simple & reliable;
+    fps2x/temporal belong to the streaming path, not this MVP)."""
+    if enhance in ("max", "photo"):
+        fam = "fsrcnnx" if enhance == "photo" else "artcnn"
+        model = _ane_model_path(src_h, fam)
+        return ["--cunny", "--ane", model] if model else ["--cunny"]
+    if enhance == "quality":
+        return ["--cunny"]
+    return []  # speed = MetalFX (vtenhance default)
+
+
+class LocalEnhancePipe(EnhancePipe):
+    """Local file -> native vtenhance -> served fMP4-HLS. No extraction, so it
+    opens instantly; enhance is sequential (~1.4x realtime) so forward play stays
+    smooth and a big forward seek waits for the enhancer to reach it. (Random-
+    access seek would need the per-segment/daemon path - see PLAN.md.)"""
+
+    def __init__(self, path: str, out_w: int, out_h: int, duration: float,
+                 vt_flags: list[str]):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="ytplay-local-")
+        self.done = False
+        self.playlist = self._build_playlist(duration)
+        cmd = ([_vtenhance_path() or "vtenhance", path, self.dir, "--hls",
+                "--seg-interval", str(self.SEG), "--scale", f"{out_w}x{out_h}",
+                "--audio"] + vt_flags)
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.yv = self.ya = None   # no yt-dlp source for a local file
+        threading.Thread(target=self._wait, daemon=True).start()
+
+    def _wait(self):   # override: no yt-dlp children to reap
+        self.proc.wait()
+        self.done = True
+        log(f"local enhance done (rc={self.proc.returncode})")
+
+    def _build_playlist(self, duration: float) -> bytes:
+        import math
+        n = max(1, math.ceil(duration / self.SEG)) if duration > 0 else 1
+        lines = ["#EXTM3U", "#EXT-X-VERSION:7",
+                 f"#EXT-X-TARGETDURATION:{int(self.SEG) + 1}",
+                 "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD",
+                 '#EXT-X-MAP:URI="init.mp4"']
+        remaining = duration or self.SEG
+        for i in range(n):
+            dur = self.SEG if remaining >= self.SEG or i < n - 1 else max(0.001, remaining)
+            lines += [f"#EXTINF:{dur:.3f},", f"s{i:03d}.m4s"]   # vtenhance names s%03d.m4s
+            remaining -= self.SEG
+        lines.append("#EXT-X-ENDLIST")
+        return ("\n".join(lines) + "\n").encode()
+
+    def wait_ready(self, timeout: float = 90.0) -> bool:
+        deadline = time.time() + timeout
+        init, seg0 = os.path.join(self.dir, "init.mp4"), os.path.join(self.dir, "s000.m4s")
+        while time.time() < deadline:
+            if os.path.exists(init) and os.path.exists(seg0):
+                return True
+            if self.done:
+                return os.path.exists(seg0)
+            time.sleep(0.2)
+        return False
+
+
+def _serve_local(path: str, args) -> int:
+    """Play a LOCAL file with enhancement: no yt-dlp extraction -> instant open.
+    Native vtenhance produces HLS we serve straight to the player."""
+    if not _vtenhance_path():
+        log("local: vtenhance not built; cannot enhance a local file"); return 1
+    w, h, fps, dur = _ffprobe_props(path)
+    if w <= 0 or h <= 0:
+        log("local: ffprobe could not read the video"); return 1
+    plan = enhance_plan(w, h, fps, args.enhance, native=True)
+    ow, oh = plan if plan else (w * 2, h * 2)   # cunny/ane clamp to 2x internally
+    vt_flags = _vt_tier_flags(args.enhance, h)
+    log(f"local {w}x{h}@{fps:g} -> {ow}x{oh} {args.enhance} (instant open, no extraction)")
+    pipe = LocalEnhancePipe(path, ow, oh, dur, vt_flags)
+    if not pipe.wait_ready():
+        pipe.cleanup(); log("local: enhancer produced no output"); return 1
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            name = os.path.basename(urllib.parse.urlparse(self.path).path)
+            body = pipe.read(name)
+            if body is None:
+                self.send_response(404); self.end_headers(); return
+            ctype = ("application/vnd.apple.mpegurl" if name.endswith(".m3u8")
+                     else "video/mp4")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        do_HEAD = do_GET
+
+    srv = RelayServer(("127.0.0.1", args.port), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    local_url = f"http://127.0.0.1:{port}/enh/index.m3u8"
+    log("serving " + local_url)
+    notify_mac("ytplay", os.path.basename(path) + " (local ✨)")
+    if not args.no_open:
+        launch_player(args.player, local_url, os.path.basename(path))
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pipe.cleanup()
+        srv.shutdown()
+    return 0
+
+
 class LocalGrowingFile:
     """Serve byte ranges from a file yt-dlp is still writing. Same get()/total
     surface as SegmentPrefetcher so the relay handler treats both alike; a
@@ -2586,6 +2725,21 @@ def main() -> int:
                         help="GPU AI upscale: speed (MetalFX) | quality (CuNNy) | "
                              "max (ArtCNN, anime) | photo (FSRCNNX, photographic). Empty = off.")
     args = parser.parse_args()
+
+    # Local file (or file:// URL): no site extraction -> instant open, near-local.
+    local_path = None
+    if args.url.startswith("file://"):
+        local_path = urllib.parse.unquote(urllib.parse.urlparse(args.url).path)
+    elif os.path.exists(args.url):
+        local_path = os.path.abspath(args.url)
+    if local_path:
+        if args.enhance in ("speed", "quality", "max", "photo"):
+            return _serve_local(local_path, args)
+        log("local file without --enhance: hand the path straight to the player")
+        if not args.no_open:
+            launch_player(args.player, "file://" + urllib.parse.quote(local_path),
+                          os.path.basename(local_path))
+        return 0
 
     proxy = args.proxy if args.proxy else detect_proxy()
     if proxy:
