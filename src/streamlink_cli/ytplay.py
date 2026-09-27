@@ -2311,6 +2311,8 @@ class LocalEnhancePipe(EnhancePipe):
     smooth and a big forward seek waits for the enhancer to reach it. (Random-
     access seek would need the per-segment/daemon path - see PLAN.md.)"""
 
+    SEG = 1.0  # 1s segments (vs EnhancePipe's 2s): first frame lands ~2x sooner.
+
     def __init__(self, path: str, out_w: int, out_h: int, duration: float,
                  vt_flags: list[str]):
         import tempfile
