@@ -20,7 +20,7 @@ const DEFAULT_PLAYER_ID = "iina";
 const DEFAULT_QUALITY = "best";
 
 // Friendly names for the enhance tiers, shared by the menu and the toasts.
-const ENH_NAME = { off: "关闭", speed: "速度", quality: "质量", max: "极限" };
+const ENH_NAME = { off: "关闭", speed: "速度", quality: "质量", max: "极限", photo: "写实" };
 
 async function rebuildMenus() {
   await chrome.contextMenus.removeAll();
@@ -54,14 +54,16 @@ async function rebuildMenus() {
     }
   }
   // Enhance selector: local GPU/ANE AI upscale before the stream reaches the
-  // player. Any yt-dlp site. Three tiers on Apple Silicon (measured):
+  // player. Any yt-dlp site. Four tiers on Apple Silicon (measured):
   //   speed   = MetalFX, guaranteed 4K60, smoothest (no CNN, no temporal).
   //   quality = CuNNy CNN super-res + motion-compensated temporal reconstruction.
-  //   max     = ArtCNN on the Neural Engine (heaviest, most detail) + the same
-  //             temporal reconstruction.
-  // BOTH CNN tiers denoise/recover compressed sources (dense GPU optical flow +
-  // multi-frame merge, +2-3dB luma): they differ in the SR model, not the
-  // temporal stage. Clean sources run 4K60; temporal (compressed) settles ~4K30.
+  //   max     = strongest temporal reconstruction (blend 0.7): cleanest, but
+  //             wax/"airbrush" on skin - best for anime or very noisy sources.
+  //   photo   = gentle temporal (blend 0.4): keeps skin/texture, still denoises -
+  //             the photographic/real-people profile.
+  // NB the SR model (FSRCNNX vs ArtCNN) is NOT the difference - measured ~42dB
+  // apart = invisible. The visible tier axis is the temporal blend strength.
+  // Clean sources run 4K60; temporal (compressed) settles ~4K30.
   const { enhanceMode } = await chrome.storage.local.get({ enhanceMode: "off" });
   chrome.contextMenus.create({
     id: "sl-enhance-menu",
@@ -72,7 +74,8 @@ async function rebuildMenus() {
     ["off", "关闭"],
     ["speed", "速度 · MetalFX · 稳 4K60,最流畅"],
     ["quality", "质量 · CuNNy 超分 + 时域重建"],
-    ["max", "极限 · ArtCNN 超分(神经引擎)+ 时域重建,细节最强"],
+    ["max", "极限 · 时域重建最强,最干净(动漫/烂源最佳)"],
+    ["photo", "写实 · 温和时域,保留皮肤纹理,真人不磨皮"],
   ];
   for (const [mode, label] of ENH) {
     chrome.contextMenus.create({

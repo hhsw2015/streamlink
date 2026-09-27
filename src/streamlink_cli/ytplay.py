@@ -30,7 +30,6 @@ import re
 import http.client
 import json
 import os
-import socket
 import socketserver
 import struct
 import subprocess
@@ -39,7 +38,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler
 
 
@@ -164,10 +163,11 @@ ENHANCE_SHADER = "CuNNy-4x12-DS.glsl"      # quality-tier CNN luma upscaler
 #   max     ArtCNN C4F16 2x   61.4 fps (GPU-bound, 1.02x realtime@60)
 # CuNNy/ArtCNN are exact-2x luma CNNs (no arbitrary scaling).
 ENHANCE_MPX_METALFX = 550_000_000
-NATIVE_TIERS = {"speed": [], "quality": ["--cunny"], "max": ["--artcnn"]}
+NATIVE_TIERS = {"speed": [], "quality": ["--cunny"], "max": ["--artcnn"],
+                "photo": ["--cunny"]}   # photo uses FSRCNNX on the ANE; CuNNy is the GPU fallback
 
 
-def _ane_model_path(height: int, f32: bool = False) -> str | None:
+def _ane_model_path(height: int, family: str = "artcnn", f32: bool = False) -> str | None:
     """Precompiled CoreML SR model matching the source height (ANE offload).
 
     The ANE runs ArtCNN ~1.5x faster than the GPU AND frees the GPU for
@@ -179,7 +179,7 @@ def _ane_model_path(height: int, f32: bool = False) -> str | None:
                  os.path.expanduser("~/Dev/metalenhance/models")):
         if not base:
             continue
-        c = os.path.join(base, f"artcnn{height}{'_f32' if f32 else ''}.mlmodelc")
+        c = os.path.join(base, f"{family}{height}{'_f32' if f32 else ''}.mlmodelc")
         if os.path.exists(c):
             return c
     return None
@@ -347,18 +347,6 @@ def _run_ytdlp(url: str, quality: str, proxy: str | None, cookies: str | None,
     return json.loads(res.stdout)
 
 
-def _direct_reachable(url: str, timeout: float = 2.5) -> bool:
-    """Quick direct TLS probe of the site host (GFW blocks fail here fast)."""
-    host = urllib.parse.urlsplit(url).hostname or ""
-    try:
-        import ssl
-        with socket.create_connection((host, 443), timeout=timeout) as sock:
-            with ssl.create_default_context().wrap_socket(sock, server_hostname=host):
-                return True
-    except OSError:
-        return False
-
-
 def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | None,
                     enhance: bool = False) -> dict:
     """Extract streams, keeping extract IP == relay IP.
@@ -369,41 +357,73 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
     direct when the site is directly reachable (5s TLS probe), proxy only
     when it isn't - and whichever path extracted also relays (info["proxy"]).
     """
-    use_direct = _direct_reachable(url) if proxy else True
-    primary = None if use_direct else proxy
-    log("extracting streams (" + ("direct" if use_direct else "proxy") + ")...")
-
-    def _extract(px):
-        return _run_ytdlp(url, quality, px, cookies, timeout=180, enhance=enhance)
+    def _extract(px, timeout=180):
+        return _run_ytdlp(url, quality, px, cookies, timeout=timeout, enhance=enhance)
 
     def _has_hls(d) -> bool:
         fmts = d.get("requested_formats") or [d]
         return any("m3u8" in (f.get("protocol") or "") for f in fmts)
 
-    try:
-        data = _extract(primary)
-        used_proxy = primary
-    except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as err:
-        if use_direct and proxy:
-            log("direct failed (" + str(err)[:120] + "), retrying via proxy...")
-            data = _extract(proxy)
-            used_proxy = proxy
-        else:
-            raise
-    # Enhance wants the HLS variant (native per-segment path). Sites like PH
-    # intermittently drop their m3u8 manifest per rotating-proxy exit, leaving
-    # only progressive. Re-extract (fresh exits) a few times to land HLS before
-    # settling for the progressive fallback (which can't use the native tier).
-    if enhance and not _has_hls(data):
-        for k in range(6):
-            log(f"enhance: no HLS variant yet, re-extracting ({k + 1}/6)...")
-            try:
-                d2 = _extract(used_proxy or proxy)
-                if _has_hls(d2):
-                    data = d2
+    def _native_ok(d) -> bool:
+        # Immediately usable by the native tier: HLS (PH muxed) or DASH (separate
+        # video+audio -> remux/sidx, e.g. YouTube). Progressive-only is NOT.
+        return _has_hls(d) or bool(d.get("requested_formats"))
+
+    if proxy and enhance:
+        # ONE parallel wave (merges the direct/proxy race AND PH's HLS hunt):
+        # fire 1 direct + several proxy at once and take the first NATIVE-capable
+        # result (HLS or DASH). PH's m3u8 is intermittent per rotating-proxy exit,
+        # so several concurrent exits reliably land it in ~one extraction; YouTube's
+        # DASH wins immediately (no pointless hunt); progressive is kept only as a
+        # last resort. This replaces the old race-THEN-hunt two-wave stall on PH.
+        log("extracting streams (parallel direct+proxy, hunting native format)...")
+        ex = ThreadPoolExecutor(max_workers=6)
+        tasks = {ex.submit(_extract, None, 15): None}
+        for _ in range(4):
+            tasks[ex.submit(_extract, proxy, 45)] = proxy
+        data = None
+        used_proxy = None
+        fallback = None
+        try:
+            for fut in as_completed(tasks):
+                try:
+                    d = fut.result()
+                except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError):
+                    continue
+                if _native_ok(d):
+                    data, used_proxy = d, tasks[fut]
                     break
-            except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError):
-                pass
+                if fallback is None:
+                    fallback = (d, tasks[fut])   # progressive: remember, keep hunting
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        if data is None and fallback is not None:
+            data, used_proxy = fallback
+        if data is None:
+            raise RuntimeError("extraction failed (direct and proxy)")
+    elif proxy:
+        # Non-enhance: race direct vs proxy, take the first success.
+        log("extracting streams (direct||proxy race)...")
+        ex = ThreadPoolExecutor(max_workers=2)
+        tasks = {ex.submit(_extract, None, 15): None,
+                 ex.submit(_extract, proxy, 180): proxy}
+        data = None
+        used_proxy = None
+        try:
+            for fut in as_completed(tasks):
+                try:
+                    data, used_proxy = fut.result(), tasks[fut]
+                    break
+                except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError):
+                    continue
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        if data is None:
+            raise RuntimeError("extraction failed (direct and proxy)")
+    else:
+        log("extracting streams (direct)...")
+        data = _extract(None)
+        used_proxy = None
 
     fmts = data.get("requested_formats")
     info = {"title": data.get("title") or "video", "duration": data.get("duration") or 0,
@@ -999,6 +1019,7 @@ class VideoRemuxer:
         self.gpu_busy = False
         self.gpu_holder = -1          # segment the current GPU job serves
         self.gpu_proc = None          # its subprocess, for fg preemption
+        self.closed = False           # cleanup() sets this to stop all GPU work
         self.gpu_waiters: set[int] = set()
         self.fg_want: set[int] = set()
         self.playhead = 0             # last foreground-requested segment
@@ -1245,6 +1266,9 @@ class VideoRemuxer:
         with self.gpu_cv:
             self.gpu_waiters.add(seg_idx)
             while True:
+                if self.closed:               # shutting down: release blocked waiters
+                    self.gpu_waiters.discard(seg_idx)
+                    raise RuntimeError("closed")
                 if not self.gpu_busy and seg_idx == self._gpu_next():
                     self.gpu_waiters.discard(seg_idx)
                     self.gpu_busy = True
@@ -1494,26 +1518,40 @@ class VideoRemuxer:
                    "--bitrate", str(mbit)]
             parts = self.enhance[2].split(":")   # "native:<tier>[:fps2x][:dnN][:aneH]"
             tier = parts[1] if len(parts) > 1 else "speed"
+            fam = "fsrcnnx" if tier == "photo" else "artcnn"   # photo = photographic model
             ane_model = None
             for pt in parts:
-                if pt.startswith("anef"):          # heavier C4F32 variant
-                    ane_model = _ane_model_path(int(pt[4:]), f32=True)
+                if pt.startswith("anef"):          # heavier C4F32 variant (max only)
+                    ane_model = _ane_model_path(int(pt[4:]), fam, f32=True)
                 elif pt.startswith("ane"):
-                    ane_model = _ane_model_path(int(pt[3:]))
-            if tier == "max" and ane_model:
+                    ane_model = _ane_model_path(int(pt[3:]), fam)
+            if tier in ("max", "photo") and ane_model:
                 # ArtCNN on the Neural Engine (faster than GPU + frees the GPU
                 # for FRC/encode). --cunny still loads the chroma kernel.
                 cmd += ["--cunny", "--ane", ane_model]
             else:
                 cmd += NATIVE_TIERS.get(tier, [])
-            if "fps2x" in parts:
-                cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps
+            warp = "warp" in parts
+            if warp:
+                # 30->60 by warping the SR'd 4K frames along GPU dense flow (no
+                # Apple FRC): CNN runs on real frames only, midpoints are a cheap
+                # warp. Measured 85fps@4K60 vs Apple-FRC 49fps (which stuttered).
+                cmd += ["--fps2x-warp"]
+            elif "fps2x" in parts:
+                cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps (Apple FRC)
             has_temporal = False
+            # Temporal blend strength IS the real tier axis (the SR model is not:
+            # FSRCNNX vs ArtCNN measure ~42dB apart = invisible). 0.7 cleans hardest
+            # but waxes skin ("磨皮"); 0.4 keeps skin/texture while still killing
+            # blocking. photo = the photographic/real profile, max = cleanest.
+            tval = "0.4" if tier == "photo" else "0.7"
             for pt in parts:
                 if pt.startswith("dn"):
-                    # compressed source: spatial denoise + temporal accumulation
-                    # (cross-frame signal recovery; motion-gated, no ghosting)
-                    cmd += ["--denoise", pt[2:], "--temporal", "0.7"]
+                    # compressed source: spatial denoise + MC temporal accumulation.
+                    # In warp mode the same dense flow drives both the history warp
+                    # and the midpoint interp (one field, two uses), so real frames
+                    # get full temporal too - not just the non-warp path.
+                    cmd += ["--denoise", pt[2:], "--temporal", tval]
                     has_temporal = True
             # Dense GPU optical flow for the MC temporal warp - BOTH CNN tiers,
             # not fps2x (matches vtenhance's !fps2x MC path). A full-res field
@@ -1523,14 +1561,14 @@ class VideoRemuxer:
             # gets it free (GPU idle - the CNN runs on the ANE). Skipped only for
             # a GPU-ArtCNN max fallback (no ANE model) where the GPU is saturated.
             if (has_temporal and "fps2x" not in parts
-                    and (tier == "quality" or (tier == "max" and ane_model))):
+                    and (tier == "quality" or (tier in ("max", "photo") and ane_model))):
                 cmd += ["--dense-flow"]
             # --hq (slower, better encode) only at <=48fps output. It's NOT free
             # on the ANE tier as once assumed: at 4K it caps the media engine at
             # ~48fps (C4F16 plain 69 -> hq 48), so forcing it at 4K60 buffered.
             # And it only buys ~+0.5dB on an already-transparent 25Mbps encode,
             # so 4K60 skips it and runs plain at ~69fps.
-            out_fps = self.src_fps * (2 if "fps2x" in parts else 1)
+            out_fps = self.src_fps * (2 if ("fps2x" in parts or "warp" in parts) else 1)
             if out_fps <= 40:      # hq caps ~48fps at 4K; keep margin (24/25/30)
                 cmd += ["--hq"]
             # (muxed sources serve audio as a SEPARATE rendition - SenPlayer
@@ -1820,6 +1858,19 @@ class VideoRemuxer:
 
     def cleanup(self):
         import shutil
+        # Stop GPU work IMMEDIATELY: kill the in-flight vtenhance subprocess and wake
+        # blocked prefetch waiters. Without this the running enhance keeps grinding the
+        # ANE/GPU/encoder after we exit (fan keeps roaring), and cancel_futures only
+        # drops QUEUED jobs, not the one already executing.
+        with self.gpu_cv:
+            self.closed = True
+            if self.gpu_proc is not None:
+                try:
+                    self.gpu_proc.terminate()
+                except OSError:
+                    pass
+                self.gpu_proc = None
+            self.gpu_cv.notify_all()
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.chunk_pool.shutdown(wait=False, cancel_futures=True)
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -2533,7 +2584,7 @@ def main() -> int:
                         help="exit N seconds after the last request (0 = run until killed)")
     parser.add_argument("--enhance", default="", metavar="MODE",
                         help="GPU AI upscale: speed (MetalFX) | quality (CuNNy) | "
-                             "max (ArtCNN). Empty = off.")
+                             "max (ArtCNN, anime) | photo (FSRCNNX, photographic). Empty = off.")
     args = parser.parse_args()
 
     proxy = args.proxy if args.proxy else detect_proxy()
@@ -2547,7 +2598,7 @@ def main() -> int:
         cookies_arg = "browser:" + args.cookies_from_browser
     try:
         info = extract_streams(args.url, args.quality, proxy, cookies_arg,
-                               enhance=(args.enhance in ("speed", "quality", "max")
+                               enhance=(args.enhance in ("speed", "quality", "max", "photo")
                                         and _vtenhance_path() is not None))
     except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as err:
         log("error: " + str(err))
@@ -2574,7 +2625,7 @@ def main() -> int:
     vsrc = info.get("video") or info.get("media") or {}
     enh_shader = _shader_path(ENHANCE_SHADER) if args.enhance else None
     enh_native_bin = (_vtenhance_path()
-                      if args.enhance in ("speed", "quality", "max") else None)
+                      if args.enhance in ("speed", "quality", "max", "photo") else None)
     _native_ok = bool(enh_native_bin and info.get("mode") == "remux")
     enh_plan = (enhance_plan(int(vsrc.get("width") or 0), int(vsrc.get("height") or 0),
                              float(vsrc.get("fps") or 30), args.enhance,
@@ -2637,37 +2688,38 @@ def main() -> int:
             # ArtCNN 46fps output). A source already >=50fps is left alone.
             src_fps = float(vsrc.get("fps") or 30)
             fps2x = src_fps < 35
-        if args.enhance == "max":
-            # No 60fps SYNTHESIS for max (mixed ANE+GPU measured 0.81x -
-            # not streamable), but a native 60fps source runs ArtCNN-ANE
-            # at 4K60 fine (69fps, 1.15x). 30fps sources stay 4K30.
+        if args.enhance in ("max", "photo"):
+            # No 60fps SYNTHESIS for the ANE tiers (mixed ANE+GPU measured 0.81x);
+            # a native 60fps source runs the ANE model at 4K60 (ArtCNN 69 /
+            # FSRCNNX-8-0-4 79fps). 30fps sources stay 4K30.
             fps2x = False
-            if args.enhance == "max":
-                # No 60fps SYNTHESIS for max (mixed ANE+GPU measured 0.81x -
-                # not streamable), but a native 60fps source runs ArtCNN-ANE
-                # at 4K60 fine (69fps, 1.15x). 30fps sources stay 4K30.
-                fps2x = False
-            # Temporal + dense-flow (2-iter GPU flow) fits 4K60 on the MAX tier
-            # (ANE CNN runs parallel to GPU flow: ~68fps) but not the quality tier
-            # (CuNNy + flow both on the GPU: ~50fps). Gate per tier so neither
-            # buffers; max keeps its denoise even at 60fps.
-            _temporal_ok = src_fps <= (61 if args.enhance == "max" else 35)
+            # Temporal + dense-flow (2-iter GPU flow) fits 4K60 on the ANE tiers
+            # (max/photo: CNN on the ANE runs parallel to GPU flow, ~68/76fps) but
+            # not the quality tier (CuNNy + flow both on the GPU: ~50fps). Gate per
+            # tier so neither buffers; the ANE tiers keep denoise even at 60fps.
+            _temporal_ok = src_fps <= (61 if args.enhance in ("max", "photo") else 35)
             dn = (_denoise_strength(vsrc)
-                  if (args.enhance in ("quality", "max") and _temporal_ok) else 0.0)
+                  if (args.enhance in ("quality", "max", "photo") and _temporal_ok) else 0.0)
             src_h = int(vsrc.get("height") or 0)
-            ane = args.enhance == "max" and _ane_model_path(src_h) is not None
-            # Heavier C4F32 only for CLEAN low-fps sources (margin to spare);
-            # compressed ones use C4F16 + temporal, 48/60fps use C4F16 for 4K60.
-            ane_f32 = (ane and not fps2x and dn <= 0 and src_fps <= 35
-                       and _ane_model_path(src_h, f32=True) is not None)
-            mode_str = ("native:" + args.enhance + (":fps2x" if fps2x else "")
+            fam = "fsrcnnx" if args.enhance == "photo" else "artcnn"   # photo=photographic
+            ane = args.enhance in ("max", "photo") and _ane_model_path(src_h, fam) is not None
+            # 30fps source -> 4K60 via SR-first GPU flow-warp VFI (measured 85fps@4K60,
+            # no Apple-FRC stutter). Needs an ANE model; applies to both ANE tiers.
+            warp = ane and src_fps < 35
+            # C4F32 (heavier, sharper) for the anime max tier: in warp mode the CNN
+            # runs on REAL frames only (mids are warped), so it fits free at 4K60
+            # (measured 76fps). Non-warp keeps it to clean low-fps sources.
+            ane_f32 = (args.enhance == "max" and ane and src_fps <= 35
+                       and _ane_model_path(src_h, f32=True) is not None
+                       and (warp or dn <= 0))
+            mode_str = ("native:" + args.enhance + (":warp" if warp else "")
                         + (f":dn{dn:.3f}" if dn > 0 else "")
                         + (f":anef{src_h}" if ane_f32 else (f":ane{src_h}" if ane else "")))
             vr_enhance = (ow, oh, mode_str)
-            engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
+            engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN", "photo": "FSRCNNX"}[args.enhance]
             log(f"mode={info['mode']}+native-enhance {video.get('width')}x{video.get('height')}"
                 f"@{src_fps:g} -> {ow}x{oh}"
-                f"{'@60(interp)' if fps2x else ''} {engine} zero-copy")
+                f"{'@60(warp)' if warp else ''} {engine} zero-copy")
         else:
             log(f"mode=remux {video.get('format_id')} {video.get('width')}x{video.get('height')} "
                 f"{video.get('vcodec')} + {audio.get('format_id')} -> fMP4 random-access")
@@ -2799,21 +2851,28 @@ def main() -> int:
         ow, oh = enh_plan
         src_fps = float(media.get("fps") or 30)
         fps2x = src_fps < 35
+        if args.enhance in ("max", "photo"):
+            fps2x = False   # ANE tiers never synthesize 60fps (see native/sidx path)
         # Temporal fits 4K60 on the max tier (ANE CNN || GPU flow) but not quality
         # (both on GPU). Gate per tier so neither buffers; max keeps denoise @60.
-        _temporal_ok = src_fps <= (61 if args.enhance == "max" else 35)
+        _temporal_ok = src_fps <= (61 if args.enhance in ("max", "photo") else 35)
         dn = (_denoise_strength(media)
-              if (args.enhance in ("quality", "max") and _temporal_ok) else 0.0)
+              if (args.enhance in ("quality", "max", "photo") and _temporal_ok) else 0.0)
         src_h = int(media.get("height") or 0)
-        ane = args.enhance == "max" and _ane_model_path(src_h) is not None
-        ane_f32 = (ane and not fps2x and dn <= 0 and src_fps <= 35
-                   and _ane_model_path(src_h, f32=True) is not None)
-        mode_str = ("native:" + args.enhance + (":fps2x" if fps2x else "")
+        fam = "fsrcnnx" if args.enhance == "photo" else "artcnn"
+        ane = args.enhance in ("max", "photo") and _ane_model_path(src_h, fam) is not None
+        warp = ane and src_fps < 35   # 30fps ANE source -> 4K60 via SR-first GPU flow-warp VFI
+        # C4F32 free in warp mode (CNN on real frames only); else clean low-fps only.
+        ane_f32 = (args.enhance == "max" and ane and src_fps <= 35
+                   and _ane_model_path(src_h, f32=True) is not None
+                   and (warp or dn <= 0))
+        mode_str = ("native:" + args.enhance + (":warp" if warp else (":fps2x" if fps2x else ""))
                     + (f":dn{dn:.3f}" if dn > 0 else "")
                     + (f":anef{src_h}" if ane_f32 else (f":ane{src_h}" if ane else "")))
-        engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN"}[args.enhance]
+        engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN", "photo": "FSRCNNX"}[args.enhance]
         log(f"mode=hls+native-enhance {media.get('width')}x{media.get('height')}"
-            f"@{src_fps:g} -> {ow}x{oh}{'@60(interp)' if fps2x else ''} {engine} muxed")
+            f"@{src_fps:g} -> {ow}x{oh}"
+            f"{'@60(warp)' if warp else ('@60(interp)' if fps2x else '')} {engine} muxed")
         try:
             remux = HlsRemuxer(media["url"], proxy, media.get("http_headers"),
                                info.get("duration") or 0, (ow, oh, mode_str))

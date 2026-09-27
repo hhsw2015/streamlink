@@ -93,7 +93,10 @@ def launch_ytplay(url: str, quality: str, scheme: str, cookies: list,
         + ((" enhance=" + enhance) if enhance else "") + " =====\n",
     )
     child_log.flush()
-    cmd = [STREAMLINK_YTPLAY, url, quality, "--idle-timeout", "300"]
+    # 120s: release the server + temp files reasonably soon after the player is
+    # closed, while still surviving a short pause. (vtenhance is killed promptly on
+    # exit via VideoRemuxer.cleanup, so GPU work stops immediately regardless.)
+    cmd = [STREAMLINK_YTPLAY, url, quality, "--idle-timeout", "120"]
     if enhance:
         cmd += ["--enhance", enhance]
     if scheme:
