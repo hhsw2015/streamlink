@@ -58,8 +58,12 @@ def log(msg: str) -> None:
     sys.stderr.flush()
 
 
+_NOTIFY_QUIET = False   # set True in prewarm/headless (--no-open) so page-load
+                        # prewarms don't flood macOS notifications
+
+
 def notify_mac(title: str, msg: str) -> None:
-    if sys.platform != "darwin":
+    if sys.platform != "darwin" or _NOTIFY_QUIET:
         return
     try:
         subprocess.Popen(
@@ -248,13 +252,23 @@ def enhance_plan(width: int, height: int, fps: float, mode: str,
     """
     if mode in ("", "off") or not width or not height:
         return None
-    if height >= 1440:                     # already high; enhancing it blows the budget
-        return None
     if native:
-        # Native CNN tiers are exact-2x luma by construction; full-chain
-        # throughput (measured 61-90fps at 4K) sustains 2x for any <=1080p60
-        # source, so no budget cap is needed.
-        return (width * 2, height * 2)
+        # <=1080p: exact-2x CNN/MetalFX SR (measured 61-90fps at 4K, sustains 2x).
+        if height < 1440:
+            return (width * 2, height * 2)
+        # >4K: passthrough (the 1x clean path is native-res only, can't downscale).
+        if height > 2160:
+            return None
+        # ~4K source: 1x restoration (temporal denoise + artifact cleanup, no
+        # upscale) - measured 86fps at 4K60 (dense-flow off; MC flow is too heavy
+        # at 4K). Real spatial SR is impossible (already 4K).
+        if height >= 2000:
+            return (width & ~1, height & ~1)
+        # 1440p: MetalFX 1.5x to 4K (the CNN is exact-2x = 5K, can't sustain 60;
+        # ANE models are fixed-1080p). MetalFX measured 85fps at 1440p60->4K.
+        return (3840, 2160)
+    if height >= 1440:                     # non-native (ffmpeg libplacebo): already high
+        return None
     fps = fps or 30.0
     src_px = width * height
     mpx = ENHANCE_MPX_METALFX if mode == "speed" else ENHANCE_MPX_PER_S
@@ -330,6 +344,14 @@ def _run_ytdlp(url: str, quality: str, proxy: str | None, cookies: str | None,
                timeout: int, fmt: str | None = None, enhance: bool = False) -> dict:
     cmd = ["yt-dlp", "--no-update", "--no-playlist", "--dump-json",
            "-f", fmt or format_selector(quality, enhance), url]
+    # Drop YouTube's `tv` player client from the default probe set: through the
+    # rotating proxy every extraction is request-bound (~0.9s/request), and the tv
+    # client here returns UNPLAYABLE = one wasted ~0.9s round-trip. The remaining
+    # web/web_embedded clients still yield the vp9 webm DASH pair the native tier
+    # needs (measured 5.5s -> 4.8s, format identical). youtube:-prefixed, so other
+    # sites ignore it; env-overridable if a future YouTube change needs tv back.
+    cmd += ["--extractor-args",
+            os.environ.get("YTPLAY_YT_EXTRACTOR_ARGS", "youtube:player_client=default,-tv")]
     if proxy:
         cmd += ["--proxy", proxy]
     if enhance:
@@ -1000,7 +1022,7 @@ class VideoRemuxer:
     SRC_NAME = "in.webm"     # temp input name for _remux (subclass: "in.mp4")
 
     def __init__(self, url: str, proxy: str | None, headers: dict | None, duration: float,
-                 enhance: tuple[int, int, str] | None = None):
+                 enhance: tuple[int, int, str] | None = None, lazy_boot: bool = False):
         from collections import OrderedDict
         import tempfile
         self._tmp = tempfile.mkdtemp(prefix="ytplay-vremux-")
@@ -1020,9 +1042,37 @@ class VideoRemuxer:
         self.gpu_holder = -1          # segment the current GPU job serves
         self.gpu_proc = None          # its subprocess, for fg preemption
         self.closed = False           # cleanup() sets this to stop all GPU work
+        # Persistent warm vtenhance: one process reused across all segments so the
+        # per-spawn cold-start (framework load + Metal pipeline compile + model
+        # load, ~0.5s) is paid ONCE, not per segment. Only in/out/start vary per
+        # request (sent over stdin); the tier flags are fixed for the session.
+        self.vt_daemon = None
+        self.vt_daemon_lock = threading.Lock()
+        self.vt_daemon_fails = 0      # consecutive failures -> give up, pure one-shot
+        self.vt_daemon_off = False
+        # Fast-open: the first FAST_SEC seconds of video are enhanced with the
+        # quick MetalFX (speed) tier via a one-shot spawn, so playback STARTS
+        # ~1.5s sooner; the heavy tier (daemon) takes over once it has warmed and
+        # caught up. Matched --bitrate keeps the init byte-identical across both
+        # tiers, so the one shared EXT-X-MAP is valid for every segment. 0 = off.
+        # GPU quiesce: when the player goes idle (paused/closed) we stop active
+        # GPU/ANE work within seconds so the fan quiets, WITHOUT tearing down the
+        # server - the next request clears this and the daemon relaunches.
+        self.quiesced = False
         self.gpu_waiters: set[int] = set()
         self.fg_want: set[int] = set()
         self.playhead = 0             # last foreground-requested segment
+        # Fast-open window origin. Startup = a "seek to 0". The first FAST_SEGS
+        # segments FROM the landing run the quick one-shot tier (preemptible, ~1.48x
+        # realtime): this both fills the buffer fast AND keeps the startup/seek burst
+        # (player requests seg0..N at once) off the non-preemptible daemon, so those
+        # segments produce in strict playback order instead of a later one grabbing
+        # the daemon and starving the segment the player needs next. Count-based (not
+        # seconds) so it's robust to uneven segment durations. Heavy tier takes over
+        # after, seamless (init byte-identical). seek_t kept for reference/logging.
+        self.seek_t = 0.0
+        self.seek_seg = 0
+        self.FAST_SEGS = int(os.environ.get("YTPLAY_FAST_SEGS", "3"))
         # Sub-segment early publish: while vtenhance splits a segment into ~2s
         # sub-segments (--seg-interval), finished subs land here so a seeking
         # player starts after the FIRST sub instead of the whole segment.
@@ -1049,15 +1099,34 @@ class VideoRemuxer:
         # order doubles as priority: the awaited segment's chunks enqueue first.
         # 12 workers ~ 3 segments x 4 chunks each downloading truly concurrently.
         self.chunk_pool = ThreadPoolExecutor(max_workers=24)
-        # canonical init + mp4 timescale come from remuxing segment 0; run in the
-        # background so server startup overlaps the player launching
         self.init_bytes = b""
         self.mp4_ts = 16000
+        self._warm_mini0 = None       # prewarm-prefetched seg0 bytes (see lazy_boot)
+        self._lazy_pending = False    # lazy_boot: seg0 enhance deferred to 1st request
         self._init_ready = threading.Event()
-        boot_ev = threading.Event()
-        self.inflight[0] = boot_ev
-        self.started.add(0)
-        threading.Thread(target=self._bootstrap, args=(boot_ev,), daemon=True).start()
+        if lazy_boot:
+            # Prewarm (no player yet): DON'T enhance seg0 now - the fan stays OFF
+            # through the whole page-load prewarm. But DO prefetch seg0's raw bytes
+            # in the background (network only), IN THIS process so the relay's proxy
+            # exit IP matches. The seg0 enhance (GPU) fires on the FIRST player
+            # request (_maybe_lazy_boot); init is released as soon as vtenhance
+            # writes it (early), so the click pays ~1s to first frame, not ~2s
+            # download + a whole-segment enhance.
+            self._lazy_pending = True
+
+            def _warm_prefetch():
+                try:
+                    self._warm_mini0 = self._mini(0)
+                except Exception as e:  # noqa: BLE001 - best-effort; the click re-fetches
+                    log("warm seg0 prefetch failed: " + repr(e))
+            threading.Thread(target=_warm_prefetch, daemon=True).start()
+        else:
+            # canonical init + mp4 timescale come from remuxing segment 0; run in the
+            # background so server startup overlaps the player launching
+            boot_ev = threading.Event()
+            self.inflight[0] = boot_ev
+            self.started.add(0)
+            threading.Thread(target=self._bootstrap, args=(boot_ev,), daemon=True).start()
 
     def _build_index(self, duration: float):
         """Webm Cues -> self.segments. Also sets self.total/header/seg_data/cues."""
@@ -1076,9 +1145,27 @@ class VideoRemuxer:
         ends = starts[1:] + [max(duration, starts[-1] + 2.0) if duration else starts[-1] + 4.0]
         self.segments = [(starts[i], max(0.001, ends[i] - starts[i])) for i in range(len(starts))]
 
+    def _maybe_lazy_boot(self) -> None:
+        """First player request after a lazy prewarm: kick off the seg0 enhance in
+        the background (the non-lazy path does this eagerly in __init__). Idempotent;
+        the publisher then releases init early, so the click sees first frame in ~1s.
+        """
+        if not self._lazy_pending:
+            return
+        with self.lock:
+            if not self._lazy_pending:
+                return
+            self._lazy_pending = False
+            boot_ev = threading.Event()
+            self.inflight[0] = boot_ev
+            self.started.add(0)
+        threading.Thread(target=self._bootstrap, args=(boot_ev,), daemon=True).start()
+
     def _bootstrap(self, ev: threading.Event):
         try:
-            init, subs0 = self._remux(self._mini(0), seg_idx=0)
+            mini0 = self._warm_mini0 or self._mini(0)   # reuse prewarm-prefetched bytes
+            self._warm_mini0 = None
+            init, subs0 = self._remux(mini0, seg_idx=0)
             self.init_bytes = init
             self.mp4_ts = self._mdhd_timescale(init)
             self._init_ready.set()
@@ -1098,12 +1185,18 @@ class VideoRemuxer:
             ev.set()
 
     def get_init(self) -> bytes | None:
+        self.quiesced = False        # a player connected: un-quiesce before booting
+        self._maybe_lazy_boot()      # lazy prewarm: start seg0 enhance on first touch
         self._init_ready.wait(timeout=90)
         if not self.init_bytes:
             try:  # bootstrap failed: one synchronous retry
-                init, _subs0 = self._remux(self._mini(0), seg_idx=0)
+                mini0 = self._warm_mini0 or self._mini(0)   # reuse prewarm-prefetched bytes
+                self._warm_mini0 = None                     # free after use
+                init, subs0 = self._remux(mini0, seg_idx=0)
                 self.init_bytes = init
                 self.mp4_ts = self._mdhd_timescale(init)
+                with self.lock:  # cache seg0 so the player's seg0 fetch skips a 2nd GPU pass
+                    self._store(0, self._patch_subs(subs0, self.segments[0][0]))
             except Exception as err:  # noqa: BLE001 - reported to the player as 404
                 log("vremux init retry failed: " + repr(err))
                 return None
@@ -1269,6 +1362,11 @@ class VideoRemuxer:
                 if self.closed:               # shutting down: release blocked waiters
                     self.gpu_waiters.discard(seg_idx)
                     raise RuntimeError("closed")
+                if self.quiesced and seg_idx not in self.fg_want:
+                    # GPU-idle: cancel background prefetch so the fan quiets. A
+                    # foreground request (fg_want) has cleared quiesced and plays on.
+                    self.gpu_waiters.discard(seg_idx)
+                    raise RuntimeError("quiesced")
                 if not self.gpu_busy and seg_idx == self._gpu_next():
                     self.gpu_waiters.discard(seg_idx)
                     self.gpu_busy = True
@@ -1281,8 +1379,16 @@ class VideoRemuxer:
                         and abs(seg_idx - self.playhead) > 8):
                     self.gpu_waiters.discard(seg_idx)
                     raise RuntimeError("stale prefetch (seeked away)")
+                # Preempt the running one-shot for THIS foreground segment when the
+                # holder is (a) a background prefetch, or (b) a HIGHER-index fg
+                # segment 1-4 ahead: at startup the player bursts seg0..N and the
+                # arrival race can let a later segment grab the GPU first, starving
+                # the one the player needs NEXT (measured: seg1 waited 3.6s behind
+                # seg2). Strict playback order = no early stutter. Only nearby (<=4)
+                # so a far seek's landing never preempts a segment still playing.
                 if (self.gpu_busy and seg_idx in self.fg_want
-                        and self.gpu_holder not in self.fg_want
+                        and (self.gpu_holder not in self.fg_want
+                             or 0 < self.gpu_holder - seg_idx <= 4)
                         and self.gpu_holder >= 0 and self.gpu_proc is not None):
                     try:
                         self.gpu_proc.terminate()
@@ -1333,7 +1439,17 @@ class VideoRemuxer:
                 ip = os.path.join(outd, "init.mp4")
                 if os.path.exists(ip):
                     try:
-                        ts = self._mdhd_timescale(open(ip, "rb").read())
+                        ib = open(ip, "rb").read()
+                        ts = self._mdhd_timescale(ib)
+                        if ib and not self.init_bytes:
+                            # Release the init the MOMENT vtenhance writes it, so
+                            # get_init() returns without waiting for the whole segment
+                            # to finish enhancing (first frame ~1s, not ~3s). Init is
+                            # byte-identical across segments/tiers, so any segment's
+                            # init.mp4 is the canonical one.
+                            self.init_bytes = ib
+                            self.mp4_ts = ts
+                            self._init_ready.set()
                     except OSError:
                         pass
             for f in files[seen:]:
@@ -1380,10 +1496,23 @@ class VideoRemuxer:
         n = self.subcount(i)
         if m < 0 or m >= n:
             return None
+        self._maybe_lazy_boot()      # lazy prewarm: start production on first touch
+        if abs(i - self.playhead) > 2:          # discontinuous jump = seek: open a
+            self.seek_t = self.segments[i][0]   # fast window at the landing
+            self.seek_seg = i
         self.playhead = i
+        self.quiesced = False        # a request = the player resumed; un-quiesce
         with self.lock:
             cached = self.cache.get(i)
             producing = i in self.inflight
+            if cached is None and producing:
+                # The player caught a segment that a background prefetch is already
+                # enhancing at bg priority. Promote it to fg_want so _gpu_acquire
+                # gives it the GPU next AND preempts whatever bg job is running -
+                # otherwise the player waits behind unrelated prefetch (measured
+                # 6s waits). get_segment already does this; get_sub (the native
+                # sub path) was missing it = the steady-state stutter.
+                self.fg_want.add(i)
         if cached is None and not producing:
             threading.Thread(target=self._produce_from, args=(i, m), daemon=True).start()
         elif cached is not None:
@@ -1474,6 +1603,177 @@ class VideoRemuxer:
                 self.pcond.notify_all()
             ev.set()
 
+    def _vt_seg_flags(self, fast: bool = False) -> list[str]:
+        """vtenhance flags. Heavy path (fast=False) is session-constant and also
+        the daemon's launch config (only in/out/start vary per request). Fast path
+        (fast=True) is the quick MetalFX tier for fast-open: SAME dims + bitrate so
+        the init stays byte-identical, but none of the heavy CNN/temporal/warp
+        flags, so it runs at ~89fps and starts playback sooner."""
+        ow, oh, _ = self.enhance
+        # Higher bitrate than a normal stream: the CNN adds high-frequency detail
+        # a stingy bitrate would crush. Local playback, so bandwidth is free.
+        mbit = 40 if oh >= 2000 else 24 if oh >= 1400 else 16
+        flags = ["--hls", "--seg-interval", str(self.SUB_S),
+                 "--scale", f"{ow}x{oh}", "--bitrate", str(mbit)]
+        parts = self.enhance[2].split(":")   # "native:<tier>[:warp][:dnN][:aneH]"
+        # --hq is the ONLY init-affecting flag (bitrate aside); the heavy tier adds
+        # it when OUTPUT fps <= 40. The fast (MetalFX) tier must make the exact same
+        # choice so its init.mp4 stays byte-identical to the heavy segments' - the
+        # whole stream shares one EXT-X-MAP. (Verified: MetalFX and cunny/ANE/warp
+        # produce identical inits given matched bitrate + hq; dims/profile/level/
+        # framerate are all identical across tiers.)
+        heavy_2x = "fps2x" in parts or "warp" in parts   # heavy tier doubles 30->60
+        heavy_hq = (self.src_fps * (2 if heavy_2x else 1)) <= 40
+        if fast and "warp" not in parts:
+            f = flags + (["--hq"] if heavy_hq else [])
+            # Match the heavy tier's OUTPUT framerate. MetalFX can't warp, but
+            # MetalFX + Apple FRC (--fps2x) also doubles to 60fps, so the fast
+            # segments and the warp segments are BOTH 60fps under the one shared
+            # init - otherwise the 30fps fast head vs 60fps warp tail reads as
+            # "stuck at 4K30" (verified: MetalFX+fps2x init == warp init).
+            if heavy_2x:
+                f += ["--fps2x"]
+            return f   # MetalFX (+FRC): fastest lane, init-identical to heavy
+        # NB: warp sources do NOT take the fast lane above - MetalFX+Apple-FRC hits
+        # the ~28fps FRC wall (0.8x = the startup stutter), while the GPU flow-warp
+        # heavy tier is 2.77x. So a "fast" warp segment runs the real warp flags
+        # (init-identical to the daemon's, and actually faster); "fast" then only
+        # means the preemptible one-shot lane, good for startup/seek burst ordering.
+        tier = parts[1] if len(parts) > 1 else "speed"
+        if tier == "clean":
+            # High-res (4K) sources: 1x restoration - temporal denoise + artifact
+            # cleanup, no super-res, no dense-flow (MC flow is too heavy at 4K;
+            # static temporal + bilateral sustain 4K60, measured 86fps).
+            f = flags + ["--clean", "--denoise", "3", "--temporal", "0.4"]
+            return (f + ["--hq"]) if heavy_hq else f
+        fam = "fsrcnnx" if tier == "photo" else "artcnn"   # photo = photographic model
+        ane_model = None
+        for pt in parts:
+            if pt.startswith("anef"):          # heavier C4F32 variant (max only)
+                ane_model = _ane_model_path(int(pt[4:]), fam, f32=True)
+            elif pt.startswith("ane"):
+                ane_model = _ane_model_path(int(pt[3:]), fam)
+        if tier in ("max", "photo") and ane_model:
+            # SR CNN on the Neural Engine (frees the GPU); --cunny loads chroma.
+            flags += ["--cunny", "--ane", ane_model]
+        else:
+            flags += NATIVE_TIERS.get(tier, [])
+        if "warp" in parts:
+            # 30->60 by warping the SR'd 4K frames along GPU dense flow (no Apple
+            # FRC): CNN on real frames only, midpoints a cheap warp (~85fps@4K60).
+            flags += ["--fps2x-warp"]
+        elif "fps2x" in parts:
+            flags += ["--fps2x"]               # ML interpolate 30 -> 60fps (Apple FRC)
+        has_temporal = False
+        # Temporal blend strength IS the real tier axis (SR model is not: FSRCNNX
+        # vs ArtCNN ~42dB apart = invisible). 0.7 cleans hardest but waxes skin
+        # ("磨皮"); 0.4 keeps skin/texture. photo = real profile, max = cleanest.
+        tval = "0.4" if tier == "photo" else "0.7"
+        for pt in parts:
+            if pt.startswith("dn"):
+                # compressed source: spatial denoise + MC temporal accumulation.
+                flags += ["--denoise", pt[2:], "--temporal", tval]
+                has_temporal = True
+        # Dense GPU optical flow for the MC temporal warp - both CNN tiers, not
+        # fps2x. quality/CuNNy costs ~2fps for +2.3dB; max/ANE gets it free (GPU
+        # idle). Skipped for a GPU-ArtCNN max fallback (no ANE) where GPU is busy.
+        if (has_temporal and "fps2x" not in parts
+                and (tier == "quality" or (tier in ("max", "photo") and ane_model))):
+            flags += ["--dense-flow"]
+        # --hq only <=48fps output: at 4K it caps the media engine ~48fps and buys
+        # only ~+0.5dB on an already-transparent encode, so 4K60 skips it.
+        if heavy_hq:
+            flags += ["--hq"]
+        return flags
+
+    def _ensure_vt_daemon(self, probe_frag: str):
+        """Return a live warm daemon, launching one (dims probed on probe_frag)
+        if needed. Caller holds vt_daemon_lock. None = unavailable (use one-shot)."""
+        if self.vt_daemon_off:
+            return None
+        p = self.vt_daemon
+        if p is not None and p.poll() is None:
+            return p
+        binp = _vtenhance_path()
+        if not binp:
+            return None
+        dummy = os.path.join(self._tmp, "vtd_probe_out")
+        cmd = [binp, probe_frag, dummy] + self._vt_seg_flags() + ["--daemon"]
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        except OSError:
+            return None
+        try:
+            ready = (p.stdout.readline() or "").strip()
+        except OSError:
+            ready = ""
+        if ready != "READY":       # compile/probe failed
+            try:
+                p.kill()
+            except OSError:
+                pass
+            return None
+        self.vt_daemon = p
+        log("vtenhance daemon warm")
+        return p
+
+    def _vt_daemon_request(self, frag: str, outd: str, start: float) -> bool:
+        """Enhance one fragment on the persistent warm daemon. Serialized by
+        _gpu_acquire (single holder) + the lock; blocks until the daemon has
+        written the whole segment to outd and replied OK. Returns False on any
+        failure so the caller falls back to a one-shot spawn; after a few
+        consecutive failures the daemon is retired (pure one-shot from then on)."""
+        with self.vt_daemon_lock:
+            p = self._ensure_vt_daemon(frag)
+            ok = False
+            if p is not None and p.stdin is not None and p.stdout is not None:
+                try:
+                    p.stdin.write(f"{frag}\t{outd}\t{start}\n")
+                    p.stdin.flush()
+                    line = p.stdout.readline()
+                    if not line:              # daemon died mid-request
+                        self.vt_daemon = None
+                    else:
+                        ok = line.strip() == "OK"
+                except (BrokenPipeError, OSError):
+                    self.vt_daemon = None
+            if ok:
+                self.vt_daemon_fails = 0
+            else:
+                self.vt_daemon_fails += 1
+                if self.vt_daemon_fails >= 3 and not self.vt_daemon_off:
+                    self.vt_daemon_off = True
+                    if self.vt_daemon is not None:
+                        try:
+                            self.vt_daemon.terminate()
+                        except OSError:
+                            pass
+                        self.vt_daemon = None
+                    log("vtenhance daemon retired after repeated failures (one-shot)")
+            return ok
+
+    def _prewarm_daemon(self, probe_frag: str) -> None:
+        """Warm the heavy daemon in the background DURING the fast window, so the
+        fast->heavy handoff (first segment past the fast window) pays no daemon
+        cold-start - that ~1s gap is the startup stutter. Idempotent + lock-guarded,
+        so it races harmlessly with the first real daemon request."""
+        try:
+            with self.vt_daemon_lock:
+                self._ensure_vt_daemon(probe_frag)
+        except Exception as e:  # noqa: BLE001 - best-effort; the real request retries
+            log("daemon prewarm failed: " + repr(e))
+
+    def _vt_spawn(self, cmd: list[str]) -> tuple[int, str]:
+        """One-shot vtenhance/ffmpeg spawn (fallback, --no-daemon, or ffmpeg
+        tier). Registers gpu_proc so a seek can SIGTERM-preempt it."""
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True)
+        with self.gpu_cv:
+            self.gpu_proc = proc
+        _, perr = proc.communicate()
+        return proc.returncode, (perr or "")
+
     def _remux(self, mini: bytes, seg_idx: int = -1, sub_from: int = 0):
         import tempfile
         d = tempfile.mkdtemp(prefix="seg-", dir=self._tmp)
@@ -1482,16 +1782,12 @@ class VideoRemuxer:
             f.write(mini)
         # No -copyts: timestamps reset to 0 so the init is identical for every
         # segment (shared EXT-X-MAP); we position each via a patched tfdt.
+        use_fast = False   # set by the native branch; drives the exec routing below
         if self.enhance and self.enhance[2].startswith("native"):
             # Native zero-copy enhance (vtenhance): VT decode -> MetalFX Spatial
             # AI upscale -> VT HEVC encode, every frame on IOSurface. Fast
             # enough (~80fps at 4K) that per-segment enhance keeps up with
             # playback AND random seeks - the tier ffmpeg could never reach.
-            ow, oh, _ = self.enhance
-            # Higher bitrate than a normal stream: the CNN adds high-frequency
-            # detail a stingy bitrate would immediately crush. Local playback,
-            # so bandwidth is free.
-            mbit = 40 if oh >= 2000 else 24 if oh >= 1400 else 16
             frag = os.path.join(d, "in.mp4")
             fcmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
                     "-i", src, "-c", "copy"]
@@ -1513,70 +1809,29 @@ class VideoRemuxer:
                 log(f"enhance frag step failed (rc={fres.returncode}): {tail[0][:200]}")
             outd = os.path.join(d, "out")
             os.makedirs(outd, exist_ok=True)
-            cmd = [_vtenhance_path() or "vtenhance", frag, outd, "--hls",
-                   "--seg-interval", str(self.SUB_S), "--scale", f"{ow}x{oh}",
-                   "--bitrate", str(mbit)]
-            parts = self.enhance[2].split(":")   # "native:<tier>[:fps2x][:dnN][:aneH]"
-            tier = parts[1] if len(parts) > 1 else "speed"
-            fam = "fsrcnnx" if tier == "photo" else "artcnn"   # photo = photographic model
-            ane_model = None
-            for pt in parts:
-                if pt.startswith("anef"):          # heavier C4F32 variant (max only)
-                    ane_model = _ane_model_path(int(pt[4:]), fam, f32=True)
-                elif pt.startswith("ane"):
-                    ane_model = _ane_model_path(int(pt[3:]), fam)
-            if tier in ("max", "photo") and ane_model:
-                # ArtCNN on the Neural Engine (faster than GPU + frees the GPU
-                # for FRC/encode). --cunny still loads the chroma kernel.
-                cmd += ["--cunny", "--ane", ane_model]
-            else:
-                cmd += NATIVE_TIERS.get(tier, [])
-            warp = "warp" in parts
-            if warp:
-                # 30->60 by warping the SR'd 4K frames along GPU dense flow (no
-                # Apple FRC): CNN runs on real frames only, midpoints are a cheap
-                # warp. Measured 85fps@4K60 vs Apple-FRC 49fps (which stuttered).
-                cmd += ["--fps2x-warp"]
-            elif "fps2x" in parts:
-                cmd += ["--fps2x"]               # ML interpolate 30 -> 60fps (Apple FRC)
-            has_temporal = False
-            # Temporal blend strength IS the real tier axis (the SR model is not:
-            # FSRCNNX vs ArtCNN measure ~42dB apart = invisible). 0.7 cleans hardest
-            # but waxes skin ("磨皮"); 0.4 keeps skin/texture while still killing
-            # blocking. photo = the photographic/real profile, max = cleanest.
-            tval = "0.4" if tier == "photo" else "0.7"
-            for pt in parts:
-                if pt.startswith("dn"):
-                    # compressed source: spatial denoise + MC temporal accumulation.
-                    # In warp mode the same dense flow drives both the history warp
-                    # and the midpoint interp (one field, two uses), so real frames
-                    # get full temporal too - not just the non-warp path.
-                    cmd += ["--denoise", pt[2:], "--temporal", tval]
-                    has_temporal = True
-            # Dense GPU optical flow for the MC temporal warp - BOTH CNN tiers,
-            # not fps2x (matches vtenhance's !fps2x MC path). A full-res field
-            # aligns moving regions the coarse 240x135 hw flow couldn't and takes
-            # flow off the media engine. quality/CuNNy has GPU headroom, so it
-            # costs only ~2fps for +2.3dB static / less motion ghosting; max/ANE
-            # gets it free (GPU idle - the CNN runs on the ANE). Skipped only for
-            # a GPU-ArtCNN max fallback (no ANE model) where the GPU is saturated.
-            if (has_temporal and "fps2x" not in parts
-                    and (tier == "quality" or (tier in ("max", "photo") and ane_model))):
-                cmd += ["--dense-flow"]
-            # --hq (slower, better encode) only at <=48fps output. It's NOT free
-            # on the ANE tier as once assumed: at 4K it caps the media engine at
-            # ~48fps (C4F16 plain 69 -> hq 48), so forcing it at 4K60 buffered.
-            # And it only buys ~+0.5dB on an already-transparent 25Mbps encode,
-            # so 4K60 skips it and runs plain at ~69fps.
-            out_fps = self.src_fps * (2 if ("fps2x" in parts or "warp" in parts) else 1)
-            if out_fps <= 40:      # hq caps ~48fps at 4K; keep margin (24/25/30)
-                cmd += ["--hq"]
+            # Fast window = the first FAST_SEGS segments from the landing (seek_seg,
+            # 0 at startup). Quick preemptible one-shots that fill the buffer fast and
+            # keep the startup/seek burst off the non-preemptible daemon.
+            use_fast = (self.FAST_SEGS > 0 and seg_idx >= 0
+                        and 0 <= seg_idx - self.seek_seg < self.FAST_SEGS
+                        and ":clean" not in self.enhance[2])   # 1x clean: no MetalFX-upscale head
+            cmd = [_vtenhance_path() or "vtenhance", frag, outd] + self._vt_seg_flags(fast=use_fast)
             # (muxed sources serve audio as a SEPARATE rendition - SenPlayer
             # only plays EXT-X-MEDIA audio, not audio muxed in the variant - so
             # the enhance pass stays video-only here.)
             if sub_from > 0:
                 # Seek landed mid-segment: enhance only from that sub onward.
                 cmd += ["--start", str(sub_from * self.SUB_S)]
+            # Warm the heavy daemon during the LAST fast segment (not the first): it
+            # is ready exactly when the heavy tier takes over, WITHOUT competing for
+            # the GPU during the critical first frames (that contention was starving
+            # seg1 = the early stutter).
+            if (use_fast and frag_ok and self.vt_daemon is None
+                    and not self.vt_daemon_off
+                    and seg_idx - self.seek_seg >= self.FAST_SEGS - 1
+                    and not os.environ.get("YTPLAY_VT_NODAEMON")):
+                threading.Thread(target=self._prewarm_daemon, args=(frag,),
+                                 daemon=True).start()
         elif self.enhance:
             # GPU upscale this segment (VideoToolbox decode -> Metal shader ->
             # VideoToolbox HEVC encode). Per-segment, so seeking anywhere only
@@ -1600,7 +1855,9 @@ class VideoRemuxer:
                    os.path.join(d, "i.m3u8")]
         native = self.enhance is not None and self.enhance[2].startswith("native")
         if self.enhance:
+            _t_wait0 = time.time()
             self._gpu_acquire(seg_idx)
+            _t_wait = time.time() - _t_wait0   # time blocked on the GPU lock (contention)
             stop_pub = threading.Event()
             pub = None
             if native and seg_idx >= 0:
@@ -1608,24 +1865,41 @@ class VideoRemuxer:
                                        args=(seg_idx, outd, stop_pub, sub_from),
                                        daemon=True)
                 pub.start()
+            rc, perr = 0, ""
+            t_enh = time.time()   # pure enhance time (after gpu_acquire), for the REQLOG run split
+            is_fg = seg_idx in self.fg_want   # the player is actively waiting on this segment
             try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.PIPE, text=True)
-                with self.gpu_cv:
-                    self.gpu_proc = proc
-                _, perr = proc.communicate()
-                res = subprocess.CompletedProcess(cmd, proc.returncode, None, perr)
+                # Routing: FOREGROUND (seek/startup/underrun) -> the warm daemon, so
+                # the latency-critical path pays no per-spawn cold-start. BACKGROUND
+                # prefetch -> a one-shot spawn, which is SIGTERM-preemptible: a
+                # foreground seek can kill it (via _gpu_acquire) instead of waiting
+                # behind it on the un-preemptible daemon. Fast-open + non-native
+                # (ffmpeg) always spawn.
+                if use_fast or (native and not is_fg):
+                    rc, perr = self._vt_spawn(cmd)        # fast-open / bg prefetch: killable one-shot
+                elif native and not os.environ.get("YTPLAY_VT_NODAEMON"):
+                    if self._vt_daemon_request(frag, outd, sub_from * self.SUB_S):
+                        rc = 0
+                    elif self.quiesced:
+                        raise RuntimeError("quiesced")   # daemon killed for idle; abort, don't respawn
+                    else:
+                        rc, perr = self._vt_spawn(cmd)   # daemon miss -> one-shot
+                else:
+                    rc, perr = self._vt_spawn(cmd)
             finally:
                 self._gpu_release()
                 stop_pub.set()
                 if pub:
                     pub.join(timeout=5)
-            if res.returncode != 0:
-                if res.returncode == -15:  # SIGTERM = seek preempted us
+            if native and seg_idx >= 0 and os.environ.get("YTPLAY_REQLOG"):
+                log(f"seg{seg_idx} gpu: wait {_t_wait:.1f}s run {time.time() - t_enh:.1f}s"
+                    f" ({'fg' if is_fg else 'bg'})")
+            if rc != 0:
+                if rc == -15:  # SIGTERM = seek preempted us (one-shot path only)
                     log(f"enhance seg{seg_idx} preempted by seek")
                     raise RuntimeError("enhance preempted")
-                tail = (res.stderr or "").strip().splitlines()[-1:] or ["?"]
-                log(f"enhance segment failed (rc={res.returncode}): {tail[0][:200]}")
+                tail = (perr or "").strip().splitlines()[-1:] or ["?"]
+                log(f"enhance segment failed (rc={rc}): {tail[0][:200]}")
                 if os.environ.get("YTPLAY_ENHANCE_DEBUG"):
                     import shutil as _sh
                     keep = f"/tmp/enh-fail-{int(time.time())}"
@@ -1719,6 +1993,8 @@ class VideoRemuxer:
     def get_segment(self, i: int) -> bytes | None:
         if i < 0 or i >= len(self.segments):
             return None
+        self._maybe_lazy_boot()      # lazy prewarm: start production on first touch
+        self.quiesced = False        # a request = the player resumed; un-quiesce
         with self.lock:
             if i in self.cache:
                 self.cache.move_to_end(i); data = self.cache[i]
@@ -1728,6 +2004,9 @@ class VideoRemuxer:
                 # so queued prefetch for the OLD position bails instead of
                 # competing with this fetch for proxy bandwidth
                 self.gen += 1
+                if abs(i - self.playhead) > 2:          # discontinuous = seek: open a
+                    self.seek_t = self.segments[i][0]   # fast window at the landing
+                    self.seek_seg = i
                 self.playhead = i
                 ev = self.inflight.get(i)
                 if ev is None:
@@ -1823,6 +2102,7 @@ class VideoRemuxer:
                 if self.inflight.get(j) is ev:
                     self.inflight.pop(j)
                 self.started.discard(j)
+                self.fg_want.discard(j)   # clear any fg promotion done while we ran
             with self.pcond:
                 self.partial.pop(j, None)
                 self.pcond.notify_all()
@@ -1856,6 +2136,30 @@ class VideoRemuxer:
         lines.append("#EXT-X-ENDLIST")
         return ("\n".join(lines) + "\n").encode()
 
+    def quiesce(self):
+        """Player went idle (paused or closed): stop active GPU/ANE work within
+        seconds so the fan quiets, but keep the server up so a resume is instant.
+        Reversible - the next player request (get_sub/get_segment) clears the flag
+        and the daemon relaunches. cleanup() is the permanent teardown; this is soft.
+        """
+        self.quiesced = True
+        with self.gpu_cv:
+            self.gen += 1                    # queued prefetch bails (stale gen)
+            if self.gpu_proc is not None:    # a bg one-shot spawn holding the GPU
+                try:
+                    self.gpu_proc.terminate()
+                except OSError:
+                    pass
+                self.gpu_proc = None
+            self.gpu_cv.notify_all()         # wake bg waiters so they bail out
+        d = self.vt_daemon                    # kill the warm daemon (relaunches on resume)
+        if d is not None:
+            self.vt_daemon = None
+            try:
+                d.terminate()
+            except OSError:
+                pass
+
     def cleanup(self):
         import shutil
         # Stop GPU work IMMEDIATELY: kill the in-flight vtenhance subprocess and wake
@@ -1871,6 +2175,16 @@ class VideoRemuxer:
                     pass
                 self.gpu_proc = None
             self.gpu_cv.notify_all()
+        # Stop the persistent warm daemon so it releases the ANE/GPU immediately.
+        # Kill without the lock: any in-flight request's readline just gets EOF
+        # (returns False) instead of us waiting out its current fragment.
+        d = self.vt_daemon
+        if d is not None:
+            self.vt_daemon = None
+            try:
+                d.terminate()
+            except OSError:
+                pass
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.chunk_pool.shutdown(wait=False, cancel_futures=True)
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -2401,6 +2715,8 @@ def _serve_local(path: str, args) -> int:
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     local_url = f"http://127.0.0.1:{port}/enh/index.m3u8"
     log("serving " + local_url)
+    if args.serve_info:
+        _write_serve_info(args.serve_info, port, local_url, os.path.basename(path), args)
     notify_mac("ytplay", os.path.basename(path) + " (local ✨)")
     if not args.no_open:
         launch_player(args.player, local_url, os.path.basename(path))
@@ -2697,6 +3013,30 @@ class RelayServer(socketserver.ThreadingTCPServer):
 # main
 # --------------------------------------------------------------------------- #
 
+def _write_serve_info(path: str, port: int, local_url: str, title: str, args) -> None:
+    """Pre-extract handshake: record this warm serving session so a caller (the
+    native host) can launch the player later WITHOUT paying extraction again.
+    Written atomically once serving is up (extraction + bootstrap done); the
+    reader checks pid liveness + timestamp before trusting it."""
+    import json as _json
+    import tempfile as _tf
+    rec = {
+        "ready": True, "pid": os.getpid(), "ts": time.time(),
+        "port": port, "url": local_url, "title": title,
+        "src": args.url, "quality": args.quality, "enhance": args.enhance,
+    }
+    try:
+        d = os.path.dirname(path) or "."
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = _tf.mkstemp(dir=d, prefix=".serveinfo-")
+        with os.fdopen(fd, "w") as f:
+            _json.dump(rec, f)
+        os.replace(tmp, path)
+        log("serve-info written: " + path)
+    except OSError as err:
+        log("serve-info write failed: " + repr(err))
+
+
 def launch_player(player: str, local_url: str, title: str) -> None:
     scheme = PLAYER_SCHEMES.get(player, player)  # raw templates allowed
     launch = (scheme
@@ -2723,10 +3063,20 @@ def main() -> int:
                         help="let yt-dlp read cookies from a browser profile (chrome/safari/...)")
     parser.add_argument("--idle-timeout", type=int, default=0,
                         help="exit N seconds after the last request (0 = run until killed)")
+    parser.add_argument("--serve-info", default="", metavar="PATH",
+                        help="pre-extract mode: after serving is ready, write a JSON "
+                             "warm-session record here (port/url/title) so a caller can "
+                             "launch the player later with no extraction wait")
     parser.add_argument("--enhance", default="", metavar="MODE",
                         help="GPU AI upscale: speed (MetalFX) | quality (CuNNy) | "
                              "max (ArtCNN, anime) | photo (FSRCNNX, photographic). Empty = off.")
     args = parser.parse_args()
+
+    # Prewarm/headless (--no-open): stay silent so page-load prewarms don't spam
+    # macOS notifications (one video would otherwise fire several).
+    if args.no_open:
+        global _NOTIFY_QUIET
+        _NOTIFY_QUIET = True
 
     # Local file (or file:// URL): no site extraction -> instant open, near-local.
     local_path = None
@@ -2844,7 +3194,19 @@ def main() -> int:
             # ArtCNN 46fps output). A source already >=50fps is left alone.
             src_fps = float(vsrc.get("fps") or 30)
             fps2x = src_fps < 35
-        if args.enhance in ("max", "photo"):
+        _src_h = int(vsrc.get("height") or 0)
+        if enh_native and _src_h >= 1440:
+            # High-res source: 2x SR makes no sense. 1440p -> MetalFX 1.5x to 4K
+            # (measured 85fps@60; the CNN is exact-2x=5K and can't sustain, ANE
+            # models are fixed-1080p). 4K -> 1x restoration (temporal denoise +
+            # artifact cleanup, no upscale; measured 86fps@4K60). Both keep the
+            # zero-copy native path (fast seek, per-segment).
+            hires_tier = "clean" if _src_h >= 2000 else "speed"
+            mode_str = "native:" + hires_tier
+            vr_enhance = (ow, oh, mode_str)
+            log(f"mode={info['mode']}+native-enhance {_src_h}p hi-res -> {ow}x{oh} "
+                f"({'restore' if hires_tier == 'clean' else 'MetalFX'})")
+        elif args.enhance in ("max", "photo"):
             # No 60fps SYNTHESIS for the ANE tiers (mixed ANE+GPU measured 0.81x);
             # a native 60fps source runs the ANE model at 4K60 (ArtCNN 69 /
             # FSRCNNX-8-0-4 79fps). 30fps sources stay 4K30.
@@ -2859,9 +3221,12 @@ def main() -> int:
             src_h = int(vsrc.get("height") or 0)
             fam = "fsrcnnx" if args.enhance == "photo" else "artcnn"   # photo=photographic
             ane = args.enhance in ("max", "photo") and _ane_model_path(src_h, fam) is not None
-            # 30fps source -> 4K60 via SR-first GPU flow-warp VFI (measured 85fps@4K60,
-            # no Apple-FRC stutter). Needs an ANE model; applies to both ANE tiers.
-            warp = ane and src_fps < 35
+            # 30->60 frame interpolation via SR-first GPU flow-warp VFI (--fps2x-warp,
+            # NOT Apple FRC): CNN on real frames, mids warped along GPU dense flow.
+            # Measured 720p30->1440p60 = 166fps out (2.77x realtime) = sustains easily
+            # (4K60 warp is 85fps). Needs an ANE model; applies to both ANE tiers.
+            # YTPLAY_NO_WARP=1 forces plain SR at the source fps (no interpolation).
+            warp = ane and src_fps < 35 and not os.environ.get("YTPLAY_NO_WARP")
             # C4F32 (heavier, sharper) for the anime max tier: in warp mode the CNN
             # runs on REAL frames only (mids are warped), so it fits free at 4K60
             # (measured 76fps). Non-warp keeps it to clean low-fps sources.
@@ -2880,22 +3245,34 @@ def main() -> int:
             log(f"mode=remux {video.get('format_id')} {video.get('width')}x{video.get('height')} "
                 f"{video.get('vcodec')} + {audio.get('format_id')} -> fMP4 random-access")
         a_up = Upstream(audio["url"], proxy, audio.get("http_headers"))
-        try:
-            with ThreadPoolExecutor(max_workers=2) as pool:  # video head ∥ audio sidx
-                r_future = pool.submit(RemuxCls, video["url"], proxy,
-                                       video.get("http_headers"),
-                                       info.get("duration") or 0, vr_enhance)
-                a_future = pool.submit(parse_sidx, a_up)
-                remux = r_future.result(timeout=90)
-                a_init, a_segs = a_future.result(timeout=90)
-            if enh_native:
-                remux.src_fps = src_fps
-        except Exception as err:
-            log("remux setup failed: " + repr(err))
-            notify_mac("ytplay failed", "remux setup: " + str(err)[:80])
-            if remux:
-                remux.cleanup()
-            return 1
+        # The rotating proxy (10808) throws intermittent SSL handshake failures /
+        # stalls on the googlevideo head fetch. One blip used to `return 1` = the
+        # player never opened. Retry: a fresh pool thread = fresh thread-local
+        # connection = fresh proxy exit, and the IP-signed URLs stay valid for
+        # hours, so re-fetching the same head on a good exit succeeds.
+        remux = None
+        for attempt in range(4):
+            try:
+                with ThreadPoolExecutor(max_workers=2) as pool:  # video head ∥ audio sidx
+                    r_future = pool.submit(RemuxCls, video["url"], proxy,
+                                           video.get("http_headers"),
+                                           info.get("duration") or 0, vr_enhance,
+                                           lazy_boot=args.no_open)
+                    a_future = pool.submit(parse_sidx, a_up)
+                    remux = r_future.result(timeout=45)
+                    a_init, a_segs = a_future.result(timeout=45)
+                if enh_native:
+                    remux.src_fps = src_fps
+                break
+            except Exception as err:
+                log(f"remux setup failed (attempt {attempt + 1}/4): " + repr(err))
+                if remux:
+                    remux.cleanup()
+                    remux = None
+                if attempt == 3:
+                    notify_mac("ytplay failed", "remux setup: " + str(err)[:80])
+                    return 1
+                time.sleep(0.5 * (attempt + 1))
         if enh_native:
             # The playlist's CODECS must describe the ENHANCED stream (hvc1),
             # not the vp9 source, or players reject the variant.
@@ -3025,6 +3402,8 @@ def main() -> int:
         mode_str = ("native:" + args.enhance + (":warp" if warp else (":fps2x" if fps2x else ""))
                     + (f":dn{dn:.3f}" if dn > 0 else "")
                     + (f":anef{src_h}" if ane_f32 else (f":ane{src_h}" if ane else "")))
+        if src_h >= 1440:   # high-res: no 2x SR - MetalFX 1.5x->4K (1440p) or 1x restore (4K)
+            mode_str = "native:" + ("clean" if src_h >= 2000 else "speed")
         engine = {"speed": "MetalFX", "quality": "CuNNy", "max": "ArtCNN", "photo": "FSRCNNX"}[args.enhance]
         log(f"mode=hls+native-enhance {media.get('width')}x{media.get('height')}"
             f"@{src_fps:g} -> {ow}x{oh}"
@@ -3125,23 +3504,37 @@ def main() -> int:
 
     local_url = f"http://127.0.0.1:{port}" + entry
     log("serving " + local_url)
+    # Extension hint: players (SenPlayer) use the name's suffix to pick a demuxer.
+    # HLS entries carry .m3u8 in the URL; the raw /media file mode needs the hint
+    # in the name or SenPlayer can hang probing the container.
+    title = info["title"]
+    if entry == "/media" and info["media"].get("ext"):
+        title += "." + info["media"]["ext"]
+    if args.serve_info:
+        _write_serve_info(args.serve_info, port, local_url, title, args)
     notify_mac("ytplay", quality_note + " ready, launching player")
 
     if not args.no_open:
-        # Extension hint: players (SenPlayer) use the name's suffix to pick a
-        # demuxer. HLS entries carry .m3u8 in the URL; the raw /media file mode
-        # needs the hint in the name or SenPlayer can hang probing the container.
-        title = info["title"]
-        if entry == "/media" and info["media"].get("ext"):
-            title += "." + info["media"]["ext"]
         launch_player(args.player, local_url, title)
 
     stop = threading.Event()
-    if args.idle_timeout:
+    # GPU_IDLE: seconds of no requests after which we quiesce GPU/ANE work (fan
+    # off) while keeping the server up for an instant resume. Much shorter than
+    # the full idle-timeout that exits the process.
+    GPU_IDLE = 10
+    if args.idle_timeout or remux is not None:
         def reaper():
+            gpu_quiesced = False
             while not stop.is_set():
-                time.sleep(5)
-                if time.time() - last_activity["t"] > args.idle_timeout:
+                time.sleep(3)
+                idle = time.time() - last_activity["t"]
+                if remux is not None and idle > GPU_IDLE and not gpu_quiesced:
+                    log(f"gpu idle {GPU_IDLE}s: quiescing (fan off, server stays up)")
+                    remux.quiesce()
+                    gpu_quiesced = True
+                elif idle <= GPU_IDLE:
+                    gpu_quiesced = False   # player resumed; allow a future quiesce
+                if args.idle_timeout and idle > args.idle_timeout:
                     log("idle timeout, exiting")
                     stop.set()
                     return

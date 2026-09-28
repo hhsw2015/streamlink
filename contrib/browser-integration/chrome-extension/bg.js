@@ -87,6 +87,17 @@ async function rebuildMenus() {
       contexts: ["link", "page", "video", "selection"],
     });
   }
+  // Pre-extract toggle: right-clicking a video warms extraction ahead of the
+  // click so Play opens ~seconds sooner. On by default; turn off if the extra
+  // right-click extractions (on videos you don't end up playing) bother you.
+  const { prewarmEnabled } = await chrome.storage.local.get({ prewarmEnabled: true });
+  chrome.contextMenus.create({
+    id: "sl-prewarm-toggle",
+    title: "⚡ 预取加速(右键预热)",
+    type: "checkbox",
+    checked: prewarmEnabled,
+    contexts: ["link", "page", "video", "selection"],
+  });
   // Legacy tree (streamlink-redirect + cloud extractor + savenow) removed:
   // savenow stopped granting free credit, so that chain dead-ends at
   // "Balance insufficient". ytplay (yt-dlp pipeline) is the only path now.
@@ -111,6 +122,12 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     return;
   }
 
+  if (info.menuItemId === "sl-prewarm-toggle") {
+    await chrome.storage.local.set({ prewarmEnabled: !!info.checked });
+    notify("预取加速: " + (info.checked ? "已开启 ⚡" : "已关闭"), "Local");
+    return;
+  }
+
   const url = info.linkUrl || info.srcUrl || info.pageUrl || (tab && tab.url);
   if (!url) return notify("no URL to open");
 
@@ -120,6 +137,8 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (ytMatch) {
     const playerId = ytMatch[1];
     const quality = ytMatch[2];
+    // Remember it so the next right-click prewarms the SAME quality (warm-key match).
+    await chrome.storage.local.set({ lastQuality: quality });
     const player = PLAYERS.find((p) => p.id === playerId);
     const { enhanceMode } = await chrome.storage.local.get({ enhanceMode: "off" });
     const enhance = enhanceMode !== "off" ? enhanceMode : "";
@@ -153,6 +172,34 @@ function sendToHost(payload, player, quality, subtitle) {
       return;
     }
     notify(player.name + " " + quality + " → launching (local, pid " + response.pid + ")", subtitle);
+  });
+}
+
+// Pre-extract: the content script fires slPrewarm on right-click. We run
+// extraction + bootstrap ahead of the click so a following "Play" skips the ~4s
+// wait. Fire-and-forget; the native host de-dupes and the warm session
+// self-expires, so a right-click that doesn't end in Play just wastes one warm.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === "slPrewarm" && msg.url) prewarm(msg.url);
+});
+
+let lastPrewarm = { url: "", at: 0 };
+async function prewarm(url) {
+  const { enhanceMode, prewarmEnabled, lastQuality } = await chrome.storage.local.get({
+    enhanceMode: "off", prewarmEnabled: true, lastQuality: "best",
+  });
+  if (!prewarmEnabled) return;
+  const now = Date.now();
+  if (url === lastPrewarm.url && now - lastPrewarm.at < 5000) return;  // de-dupe
+  lastPrewarm = { url, at: now };
+  const enhance = enhanceMode !== "off" ? enhanceMode : "";
+  const cookies = await collectCookies(url);
+  // Prewarm the quality you played last (learned below); the warm key is
+  // (url,quality,enhance), so a matching pick reuses it and a different one just
+  // extracts fresh (no worse than today).
+  const payload = { engine: "ytplay", action: "prewarm", url, quality: lastQuality, enhance, cookies };
+  chrome.runtime.sendNativeMessage(HOST, payload, () => {
+    if (chrome.runtime.lastError) console.warn("[prewarm]", chrome.runtime.lastError.message);
   });
 }
 
