@@ -30,6 +30,7 @@ import re
 import http.client
 import json
 import os
+import signal
 import socketserver
 import struct
 import subprocess
@@ -831,15 +832,43 @@ def media_playlist(path: str, init_end: int, segments: list) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _head_video_range(head: bytes) -> str:
+    """Best-effort HDR transfer from a webm/mp4 head -> HLS VIDEO-RANGE (PQ/HLG/'').
+    yt-dlp's dynamic_range conflates PQ and HLG (it labels HLG as 'HDR10'), and a
+    wrong VIDEO-RANGE mis-tone-maps, so read the real transfer characteristic:
+    H.273 code 16 = PQ (SMPTE ST 2084), 18 = HLG (ARIB STD-B67)."""
+    tc = None
+    i = head.find(b"nclx")                       # mp4 colr: nclx + primaries,transfer,matrix (2B each)
+    if i >= 0 and i + 8 <= len(head):
+        tc = int.from_bytes(head[i + 6:i + 8], "big")
+    if tc is None:
+        j = head.find(b"\x55\xba")               # Matroska TransferCharacteristics element
+        if j >= 0 and j + 3 <= len(head) and head[j + 2] == 0x81:  # 1-byte EBML size
+            tc = head[j + 3]
+    return "PQ" if tc == 16 else "HLG" if tc == 18 else ""
+
+
 def master_playlist(video: dict, audio: dict) -> str:
     vcodec = video.get("vcodec") or "avc1"
     bandwidth = int(((video.get("tbr") or 2000) + (audio.get("tbr") or 128)) * 1000)
+    # HDR signalling: the enhanced stream keeps the source's dynamic range (vtenhance
+    # tags the HEVC BT.2020 + PQ/HLG). Advertise VIDEO-RANGE so the player switches
+    # to HDR instead of showing the 10-bit signal as washed SDR. Prefer the transfer
+    # read from the actual bitstream (video_range) - yt-dlp's dynamic_range mislabels
+    # HLG as HDR10, and a wrong VIDEO-RANGE mis-tone-maps.
+    vrange = video.get("video_range") or ""
+    if not vrange:
+        dr = str(video.get("dynamic_range") or "").upper()
+        vrange = "HLG" if "HLG" in dr else ("PQ" if dr in ("HDR", "HDR10", "HDR10+", "PQ", "DV") else "")
+    inf = (f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},'
+           f'CODECS="{vcodec},mp4a.40.2",'
+           f'RESOLUTION={video.get("width")}x{video.get("height")},'
+           + (f'VIDEO-RANGE={vrange},' if vrange else "")
+           + 'AUDIO="a"')
     return "\n".join([
         "#EXTM3U",
         '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,URI="a.m3u8"',
-        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},'
-        f'CODECS="{vcodec},mp4a.40.2",'
-        f'RESOLUTION={video.get("width")}x{video.get("height")},AUDIO="a"',
+        inf,
         "v.m3u8",
     ]) + "\n"
 
@@ -1141,6 +1170,7 @@ class VideoRemuxer:
         if not self.cues or self.first_cluster is None:
             raise RuntimeError("webm Cues not found in head")
         self.header = head[:self.first_cluster]
+        self.video_range = _head_video_range(self.header)   # PQ/HLG/'' for the playlist
         starts = [t for t, _ in self.cues]
         ends = starts[1:] + [max(duration, starts[-1] + 2.0) if duration else starts[-1] + 4.0]
         self.segments = [(starts[i], max(0.001, ends[i] - starts[i])) for i in range(len(starts))]
@@ -1624,7 +1654,7 @@ class VideoRemuxer:
         # framerate are all identical across tiers.)
         heavy_2x = "fps2x" in parts or "warp" in parts   # heavy tier doubles 30->60
         heavy_hq = (self.src_fps * (2 if heavy_2x else 1)) <= 40
-        if fast and "warp" not in parts:
+        if fast and "warp" not in parts and "hdr" not in parts:
             f = flags + (["--hq"] if heavy_hq else [])
             # Match the heavy tier's OUTPUT framerate. MetalFX can't warp, but
             # MetalFX + Apple FRC (--fps2x) also doubles to 60fps, so the fast
@@ -1634,11 +1664,13 @@ class VideoRemuxer:
             if heavy_2x:
                 f += ["--fps2x"]
             return f   # MetalFX (+FRC): fastest lane, init-identical to heavy
-        # NB: warp sources do NOT take the fast lane above - MetalFX+Apple-FRC hits
-        # the ~28fps FRC wall (0.8x = the startup stutter), while the GPU flow-warp
-        # heavy tier is 2.77x. So a "fast" warp segment runs the real warp flags
-        # (init-identical to the daemon's, and actually faster); "fast" then only
-        # means the preemptible one-shot lane, good for startup/seek burst ordering.
+        # NB: warp AND hdr sources do NOT take the MetalFX fast lane above. For warp
+        # it hits the ~28fps Apple-FRC wall (0.8x stutter) vs the 2.77x GPU flow-warp.
+        # For HDR, MetalFX is BGRA8 = SDR-only: it would tag seg0's shared init SDR
+        # (breaking HDR for the whole stream, and diverging from the heavy segments'
+        # HDR init). So a "fast" warp/hdr segment runs the real CNN flags
+        # (init-identical to the daemon's); "fast" then only means the preemptible
+        # one-shot lane, good for startup/seek burst ordering.
         tier = parts[1] if len(parts) > 1 else "speed"
         if tier == "clean":
             # High-res (4K) sources: 1x restoration - temporal denoise + artifact
@@ -2206,6 +2238,7 @@ class SidxRemuxer(VideoRemuxer):
         if not segs:
             raise RuntimeError("sidx has no segments")
         self.sidx_init = self.up.fetch_range(0, self.data_anchor - 1)
+        self.video_range = _head_video_range(self.sidx_init)   # PQ/HLG/'' for the playlist
         self.seg_ranges = [(off, off + size - 1) for off, size, _ in segs]
         starts, t = [], 0.0
         for _off, _size, d in segs:
@@ -2619,6 +2652,33 @@ def _vt_tier_flags(enhance: str, src_h: int) -> list[str]:
     return []  # speed = MetalFX (vtenhance default)
 
 
+def _is_dovi_p5p7(path: str) -> bool:
+    """True if `path` is Dolby Vision P5/P7 (dvhe/dvh1: IPT/dual-layer base with no usable
+    color tags). vtenhance decodes these in-process (passthrough demux + VT + inline RPU
+    -> BT.2020 PQ), so we just need to detect them to force a CNN tier (the RPU path is
+    10-bit/NV12, not MetalFX). P8.1 (hvc1, HDR10-compatible) decodes on the normal path."""
+    try:
+        prim, trc, tag = (subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=color_primaries,color_transfer,codec_tag_string",
+             "-of", "default=nk=1:nw=1", path],
+            capture_output=True, text=True, timeout=30).stdout.strip().lower().splitlines() + ["", "", ""])[:3]
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if prim == "bt2020" and trc in ("smpte2084", "arib-std-b67"):
+        return False   # HDR10/HLG-compatible base (incl. DoVi P8.1) - normal path handles it
+    if tag in ("dvhe", "dvh1"):
+        return True
+    try:   # in-band RPU with no color tags = P5/P7
+        fr = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+             "-show_frames", "-show_entries", "frame=side_data_type", "-of", "csv", path],
+            capture_output=True, text=True, timeout=30).stdout.lower()
+        return "dolby vision" in fr
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 class LocalEnhancePipe(EnhancePipe):
     """Local file -> native vtenhance -> served fMP4-HLS. No extraction, so it
     opens instantly; enhance is sequential (~1.4x realtime) so forward play stays
@@ -2683,7 +2743,15 @@ def _serve_local(path: str, args) -> int:
         log("local: ffprobe could not read the video"); return 1
     plan = enhance_plan(w, h, fps, args.enhance, native=True)
     ow, oh = plan if plan else (w * 2, h * 2)   # cunny/ane clamp to 2x internally
-    vt_flags = _vt_tier_flags(args.enhance, h)
+    # Dolby Vision P5/P7: vtenhance decodes it in-process (auto-detected from the dvhe
+    # track) and reconstructs BT.2020 PQ - no preprocess. It just needs a CNN tier, since
+    # the RPU path is 10-bit/NV12 (MetalFX is BGRA8 SDR).
+    if _is_dovi_p5p7(path):
+        dv_tier = args.enhance if args.enhance in ("max", "photo", "quality") else "quality"
+        vt_flags = _vt_tier_flags(dv_tier, h)
+        log("local: Dolby Vision P5/P7 -> in-process BT.2020 PQ reconstruction")
+    else:
+        vt_flags = _vt_tier_flags(args.enhance, h)
     log(f"local {w}x{h}@{fps:g} -> {ow}x{oh} {args.enhance} (instant open, no extraction)")
     pipe = LocalEnhancePipe(path, ow, oh, dur, vt_flags)
     if not pipe.wait_ready():
@@ -3123,6 +3191,31 @@ def main() -> int:
     last_activity = {"t": time.time()}
     enh_holder: dict = {}
 
+    # Prewarm/headless self-reap for the EXTRACTION phase. The normal idle reaper
+    # further down only starts AFTER extraction completes - so a prewarm whose
+    # extraction hangs or drags on the slow rotating proxy (HDR especially) would sit
+    # there, never played, never reaped, its yt-dlp children burning CPU (the "fan
+    # still on after I closed the player"). A prewarm's whole value is being READY
+    # fast; one that can't even start serving within EXTRACT_CAP is useless, so cap the
+    # extraction phase hard and take the process group (yt-dlp children) down with it.
+    # Once serving starts (or a player connects), bow out - the idle reaper below owns
+    # the ready/unplayed lifetime and exits at idle-timeout.
+    served_flag = {"ok": False}
+    if args.no_open and args.idle_timeout:
+        _spawn_t = last_activity["t"]
+        EXTRACT_CAP = 45
+        def _prewarm_watchdog():
+            while time.time() - _spawn_t < EXTRACT_CAP:
+                time.sleep(2)
+                if served_flag["ok"] or last_activity["t"] > _spawn_t:
+                    return   # serving (or played) -> idle reaper owns it from here
+            log("prewarm extraction exceeded cap (never served), hard-exit (reaping yt-dlp children)")
+            try:
+                os.killpg(os.getpgrp(), signal.SIGKILL)   # group leader (start_new_session): takes children
+            except OSError:
+                os._exit(0)
+        threading.Thread(target=_prewarm_watchdog, daemon=True).start()
+
     # Enhance mode: per-segment GPU upscale with the SAME random-access engine as
     # remux (VideoRemuxer + enhance filter), so seeking anywhere only enhances the
     # requested segments - no sequential-transcode buffering. Video is webm/vp9
@@ -3195,13 +3288,17 @@ def main() -> int:
             src_fps = float(vsrc.get("fps") or 30)
             fps2x = src_fps < 35
         _src_h = int(vsrc.get("height") or 0)
+        # HDR (BT.2020 PQ/HLG): only the CNN/clean tiers carry 10-bit HDR end to end;
+        # MetalFX (speed) is BGRA8 = SDR-only and would drop it. Keep HDR off MetalFX.
+        is_hdr = str(vsrc.get("dynamic_range") or "").upper() not in ("", "SDR", "NONE")
         if enh_native and _src_h >= 1440:
             # High-res source: 2x SR makes no sense. 1440p -> MetalFX 1.5x to 4K
             # (measured 85fps@60; the CNN is exact-2x=5K and can't sustain, ANE
             # models are fixed-1080p). 4K -> 1x restoration (temporal denoise +
             # artifact cleanup, no upscale; measured 86fps@4K60). Both keep the
-            # zero-copy native path (fast seek, per-segment).
-            hires_tier = "clean" if _src_h >= 2000 else "speed"
+            # zero-copy native path (fast seek, per-segment). HDR 1440p+ -> clean
+            # (1x HDR restore) since MetalFX would strip HDR.
+            hires_tier = "clean" if (_src_h >= 2000 or is_hdr) else "speed"
             mode_str = "native:" + hires_tier
             vr_enhance = (ow, oh, mode_str)
             log(f"mode={info['mode']}+native-enhance {_src_h}p hi-res -> {ow}x{oh} "
@@ -3233,7 +3330,7 @@ def main() -> int:
             ane_f32 = (args.enhance == "max" and ane and src_fps <= 35
                        and _ane_model_path(src_h, f32=True) is not None
                        and (warp or dn <= 0))
-            mode_str = ("native:" + args.enhance + (":warp" if warp else "")
+            mode_str = ("native:" + args.enhance + (":warp" if warp else "") + (":hdr" if is_hdr else "")
                         + (f":dn{dn:.3f}" if dn > 0 else "")
                         + (f":anef{src_h}" if ane_f32 else (f":ane{src_h}" if ane else "")))
             vr_enhance = (ow, oh, mode_str)
@@ -3277,7 +3374,8 @@ def main() -> int:
             # The playlist's CODECS must describe the ENHANCED stream (hvc1),
             # not the vp9 source, or players reject the variant.
             ow, oh = enh_plan
-            video = dict(video, vcodec="hvc1.2.4.L153.B0", width=ow, height=oh)
+            video = dict(video, vcodec="hvc1.2.4.L153.B0", width=ow, height=oh,
+                         video_range=getattr(remux, "video_range", ""))
         playlists = {
             "/master.m3u8": master_playlist(video, audio),
             "/v.m3u8": remux.video_playlist().decode(),
@@ -3503,6 +3601,7 @@ def main() -> int:
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     local_url = f"http://127.0.0.1:{port}" + entry
+    served_flag["ok"] = True   # extraction done, server up: prewarm watchdog bows out to the idle reaper
     log("serving " + local_url)
     # Extension hint: players (SenPlayer) use the name's suffix to pick a demuxer.
     # HLS entries carry .m3u8 in the URL; the raw /media file mode needs the hint
