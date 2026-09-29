@@ -3161,6 +3161,34 @@ def main() -> int:
                           os.path.basename(local_path))
         return 0
 
+    # Network Dolby Vision (direct media URL): vtenhance's decoder (AVAssetReader) can't
+    # stream a remote asset, so a DoVi P5/P7 URL must be downloaded to a local file first,
+    # then run through the local DoVi path (in-process BT.2020 reconstruction). Extension-
+    # gated + probed so ordinary site URLs still go to yt-dlp.
+    if (args.enhance in ("speed", "quality", "max", "photo")
+            and re.search(r"\.(mkv|mp4|m4v|ts|hevc)(\?|$)", args.url, re.I)
+            and _is_dovi_p5p7(args.url)):
+        import tempfile
+        ext = os.path.splitext(urllib.parse.urlparse(args.url).path)[1] or ".mp4"
+        tmp = tempfile.mktemp(prefix="ytplay-netdovi-", suffix=ext)
+        log(f"network Dolby Vision -> downloading (AVAssetReader can't stream remote): {args.url}")
+        try:
+            req = urllib.request.Request(args.url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
+                while (chunk := r.read(1 << 20)):
+                    f.write(chunk)
+        except OSError as err:
+            log(f"network DoVi download failed: {err!r}")
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        else:
+            rc = _serve_local(tmp, args)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return rc
+
     proxy = args.proxy if args.proxy else detect_proxy()
     if proxy:
         log("proxy: " + proxy)
