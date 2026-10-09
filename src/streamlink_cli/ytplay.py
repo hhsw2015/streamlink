@@ -362,7 +362,7 @@ def _run_ytdlp(url: str, quality: str, proxy: str | None, cookies: str | None,
         # the m3u8 formats and returns only progressive (no native enhance).
         # Each extractor retry rides a fresh exit, so a handful reliably lands
         # the HLS manifest.
-        cmd += ["--extractor-retries", "12", "--retries", "12"]
+        cmd += ["--extractor-retries", "20", "--retries", "20"]
     cmd += _cookie_args(cookies)
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if res.returncode != 0:
@@ -394,20 +394,21 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
         return _has_hls(d) or bool(d.get("requested_formats"))
 
     if proxy and enhance:
-        # ONE parallel wave (merges the direct/proxy race AND PH's HLS hunt):
-        # fire 1 direct + several proxy at once and take the first NATIVE-capable
-        # result (HLS or DASH). PH's m3u8 is intermittent per rotating-proxy exit,
-        # so several concurrent exits reliably land it in ~one extraction; YouTube's
-        # DASH wins immediately (no pointless hunt); progressive is kept only as a
-        # last resort. This replaces the old race-THEN-hunt two-wave stall on PH.
-        log("extracting streams (parallel direct+proxy, hunting native format)...")
-        ex = ThreadPoolExecutor(max_workers=6)
-        tasks = {ex.submit(_extract, None, 15): None}
-        for _ in range(4):
-            tasks[ex.submit(_extract, proxy, 45)] = proxy
+        # Enhance MUST stay native (HLS/DASH). PornHub's HLS manifest 4xx's on MOST
+        # rotating-proxy exits, and the proxy drops connections under heavy concurrency
+        # ("SSL_connect closed abruptly"), so a wide fan-out is self-defeating. Use mild
+        # concurrency (1 direct fast-fail + 2 proxy) to catch the easy case (YouTube DASH,
+        # or a lucky PH exit), then PERSIST serially - one exit at a time, no contention -
+        # retrying fresh exits until a native format lands (bounded deadline). No
+        # progressive fallback: a progressive file can't be enhanced.
+        log("extracting streams (hunting native format)...")
+        deadline = time.time() + 150
         data = None
         used_proxy = None
-        fallback = None
+        ex = ThreadPoolExecutor(max_workers=3)
+        tasks = {ex.submit(_extract, None, 15): None,
+                 ex.submit(_extract, proxy, 75): proxy,
+                 ex.submit(_extract, proxy, 75): proxy}
         try:
             for fut in as_completed(tasks):
                 try:
@@ -417,14 +418,18 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
                 if _native_ok(d):
                     data, used_proxy = d, tasks[fut]
                     break
-                if fallback is None:
-                    fallback = (d, tasks[fut])   # progressive: remember, keep hunting
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
-        if data is None and fallback is not None:
-            data, used_proxy = fallback
+        # serial persistence: fresh exits, one at a time, until the native m3u8/DASH lands
+        while data is None and time.time() < deadline:
+            try:
+                d = _extract(proxy, 75)
+            except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError):
+                continue
+            if _native_ok(d):
+                data, used_proxy = d, proxy
         if data is None:
-            raise RuntimeError("extraction failed (direct and proxy)")
+            raise RuntimeError("extraction failed: could not land a native (HLS/DASH) format")
     elif proxy:
         # Non-enhance: race direct vs proxy, take the first success.
         log("extracting streams (direct||proxy race)...")
