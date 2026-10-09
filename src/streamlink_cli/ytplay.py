@@ -292,24 +292,25 @@ def format_selector(quality: str, enhance: bool = False) -> str:
         f"bv*{h}[vcodec^=vp9][ext=webm]+ba[ext=m4a][protocol=https]/"
         if (_remux_tier(quality) or enhance) else ""
     )
-    # Enhance: prefer a muxed HLS single format over a progressive file -
-    # muxed HLS goes through the native tier (HlsRemuxer, per-segment enhance,
-    # fast seek); progressive would fall back to the slow sequential pipe.
-    hls_muxed = f"b{h}[protocol^=m3u8]/" if enhance else ""
     # Preference order:
     #   0.   (M1/M2 >1080p or enhance) vp9 webm + AAC -> remux mode, hw decode
     #   1/2. fMP4 pairs (av01 first: better compression + hw decode) -> sidx mode
     #   3.   any https video + m4a audio pair (some sites serve vp9-in-mp4)
-    #   4.   (enhance) muxed HLS single format -> native HlsRemuxer
-    #   5.   best single format at target height (progressive file or HLS)
-    #   6.   absolute best anything
+    #   4.   muxed HLS single format -> native HlsRemuxer
+    #   5.   (non-enhance only) best single format: progressive file or HLS
+    #   6.   (non-enhance only) absolute best anything
+    # Enhance MUST stay on the native tier: end at the muxed-HLS branch with NO
+    # progressive fallback. A progressive file (e.g. PornHub's width-less, IP-signed
+    # `1080p`) can't be enhanced (no width -> no plan; IP-signed -> cache mode), so
+    # falling back to it silently drops out of native. Ending native-only makes yt-dlp
+    # fail instead - and --extractor-retries re-extracts on a fresh proxy exit until the
+    # intermittent m3u8 lands (PornHub's HLS is per-exit flaky).
     return (
         vp9_remux +
         f"bv*{h}[vcodec^=av01][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
         f"bv*{h}[vcodec^=avc1][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
         f"bv*{h}[ext=mp4][protocol=https]+ba[acodec^=mp4a][protocol=https]/"
-        + hls_muxed +
-        f"b{h}/b"
+        + (f"b{h}[protocol^=m3u8]" if enhance else f"b{h}[protocol^=m3u8]/b{h}/b")
     )
 
 
