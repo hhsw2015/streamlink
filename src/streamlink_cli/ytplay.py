@@ -102,6 +102,28 @@ def detect_proxy() -> str | None:
     return None
 
 
+def _direct_media_url(url: str) -> bool:
+    """Direct media file/manifest URL (no site page to scrape)."""
+    path = urllib.parse.urlsplit(url).path.lower()
+    return path.endswith((".mp4", ".m4v", ".mov", ".mkv", ".webm", ".ts",
+                          ".hevc", ".m3u8"))
+
+
+def _is_local_host(url: str) -> bool:
+    """Loopback / private-LAN / .local source (e.g. a MyTube server)."""
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith((".local", ".lan")):
+        return True
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private
+
+
 # --------------------------------------------------------------------------- #
 # yt-dlp extraction
 # --------------------------------------------------------------------------- #
@@ -381,8 +403,14 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
     direct when the site is directly reachable (5s TLS probe), proxy only
     when it isn't - and whichever path extracted also relays (info["proxy"]).
     """
+    # A direct media URL has exactly one format; the enhance selector's
+    # native-only (m3u8) tail would match nothing for a direct mp4/webm, and
+    # main() enhances progressive via download-to-local anyway. So direct URLs
+    # always use the plain selector (which still prefers m3u8 when it IS one).
+    _enh_sel = enhance and not _direct_media_url(url)
+
     def _extract(px, timeout=180):
-        return _run_ytdlp(url, quality, px, cookies, timeout=timeout, enhance=enhance)
+        return _run_ytdlp(url, quality, px, cookies, timeout=timeout, enhance=_enh_sel)
 
     def _has_hls(d) -> bool:
         fmts = d.get("requested_formats") or [d]
@@ -393,7 +421,7 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
         # video+audio -> remux/sidx, e.g. YouTube). Progressive-only is NOT.
         return _has_hls(d) or bool(d.get("requested_formats"))
 
-    if proxy and enhance:
+    if proxy and enhance and not _direct_media_url(url):
         # Enhance MUST stay native (HLS/DASH). PornHub's HLS manifest 4xx's on MOST
         # rotating-proxy exits, and the proxy drops connections under heavy concurrency
         # ("SSL_connect closed abruptly"), so a wide fan-out is self-defeating. Use mild
@@ -402,7 +430,13 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
         # retrying fresh exits until a native format lands (bounded deadline). No
         # progressive fallback: a progressive file can't be enhanced.
         log("extracting streams (hunting native format)...")
-        deadline = time.time() + 150
+        # PornHub's m3u8 410s per rotating-proxy exit, but each yt-dlp extraction
+        # already samples ~20 exits (--extractor-retries). A persistent hunt over
+        # ~120s samples enough exits to land a live manifest whenever HLS is merely
+        # flaky; a full failure past that = a genuinely dead window (HLS 410 on
+        # ~every exit), which no amount of retrying fixes (progressive is IP-locked
+        # to an unreproducible exit -> unreachable here).
+        deadline = time.time() + 120
         data = None
         used_proxy = None
         ex = ThreadPoolExecutor(max_workers=3)
@@ -423,13 +457,29 @@ def extract_streams(url: str, quality: str, proxy: str | None, cookies: str | No
         # serial persistence: fresh exits, one at a time, until the native m3u8/DASH lands
         while data is None and time.time() < deadline:
             try:
-                d = _extract(proxy, 75)
+                d = _extract(proxy, 45)
             except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError):
                 continue
             if _native_ok(d):
                 data, used_proxy = d, proxy
         if data is None:
-            raise RuntimeError("extraction failed: could not land a native (HLS/DASH) format")
+            # Native (HLS/DASH) never landed - e.g. PornHub's m3u8 manifest 410s on
+            # every rotating-proxy exit right now, so only progressive remains. The
+            # progressive mp4 IS a fine source; it's just IP-signed (per-segment
+            # remote enhance 403s) and width-less. Extract it and let main() download
+            # it whole to a local file, then enhance locally (AVAssetReader needs a
+            # local file; ffprobe recovers the real dimensions). Enhanced playback
+            # instead of no playback.
+            log("native unavailable -> progressive fallback (download-to-local enhance)")
+            for px in (proxy, None):
+                try:
+                    data = _run_ytdlp(url, quality, px, cookies, timeout=60, enhance=False)
+                    used_proxy = px
+                    break
+                except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError):
+                    continue
+            if data is None:
+                raise RuntimeError("extraction failed: no native and no progressive format")
     elif proxy:
         # Non-enhance: race direct vs proxy, take the first success.
         log("extracting streams (direct||proxy race)...")
@@ -2739,6 +2789,86 @@ class LocalEnhancePipe(EnhancePipe):
         return False
 
 
+def _download_progressive_local(proxy: str | None, media: dict) -> str | None:
+    """Download an IP-signed progressive file WHOLE to a local temp file so it can
+    be enhanced locally. vtenhance's AVAssetReader can't stream a remote/IP-signed
+    URL and progressive is often width-less (no streaming enhance plan); a local
+    file sidesteps both (ffprobe recovers the real dimensions). Downloads through
+    Upstream (pinned keep-alive exit + retry-to-good-exit) instead of yt-dlp - a
+    rotating-proxy exit mismatch between yt-dlp's extract and its download gets the
+    signed URL a 403/474. Returns the path, or None on failure."""
+    url = media.get("url")
+    if not url:
+        return None
+    import tempfile
+    tmp = tempfile.mktemp(prefix="ytplay-prog-", suffix="." + (media.get("ext") or "mp4"))
+    up = Upstream(url, proxy, media.get("http_headers"))
+    # Total size from Content-Range, retrying a few fresh exits past a bad one. An
+    # IP-locked URL (PornHub: 474 Unauthorized on every exit but the signing one,
+    # which a rotating proxy never reproduces) fails all tries fast -> bail to the
+    # caller's raw relay rather than flailing. Reachable progressive (non-IP-locked
+    # sites) lands on the first good exit.
+    total = 0
+    no_range = False
+    for _ in range(3):
+        try:
+            res = up.request("bytes=0-0")
+            mm = re.match(r"bytes \d+-\d+/(\d+)", res.headers.get("Content-Range", ""))
+            if res.status == 206 and mm:
+                res.read()
+                total = int(mm.group(1))
+                break
+            if res.status == 200:
+                # Range ignored: the body IS the whole file - don't read it here.
+                no_range = True
+                up._drop()
+                break
+        except (http.client.HTTPException, OSError):
+            pass
+        up._drop()
+        time.sleep(0.3)
+    if total <= 0 and not no_range:
+        log("progressive download: source unreachable (no good exit)")
+        return None
+    if total > 0:
+        log(f"downloading progressive {media.get('height') or '?'}p whole to local "
+            f"({total / 1e6:.0f} MB; HLS unavailable, waits for the full file)...")
+        CHUNK = 8 << 20
+        try:
+            with open(tmp, "wb") as f:
+                start = 0
+                while start < total:
+                    end = min(start + CHUNK, total) - 1
+                    f.write(up.fetch_range(start, end))
+                    start = end + 1
+        except (RuntimeError, http.client.HTTPException, OSError) as err:
+            log("progressive download failed: " + repr(err))
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            return None
+        return tmp
+    # No Range support (status 200, no Content-Range - e.g. a chunked local
+    # stream endpoint): sequential whole-body download.
+    log("progressive download: no range support, sequential whole-file...")
+    try:
+        up._drop()
+        res = up.request(None)
+        if res.status >= 400:
+            raise UpstreamHTTPError(res.status)
+        with open(tmp, "wb") as f:
+            while (chunk := res.read(1 << 20)):
+                f.write(chunk)
+    except (RuntimeError, http.client.HTTPException, OSError) as err:
+        log("progressive download failed: " + repr(err))
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return None
+    if os.path.getsize(tmp) == 0:
+        os.remove(tmp)
+        return None
+    return tmp
+
+
 def _serve_local(path: str, args) -> int:
     """Play a LOCAL file with enhancement: no yt-dlp extraction -> instant open.
     Native vtenhance produces HLS we serve straight to the player."""
@@ -2763,11 +2893,14 @@ def _serve_local(path: str, args) -> int:
     if not pipe.wait_ready():
         pipe.cleanup(); log("local: enhancer produced no output"); return 1
 
+    last_activity = {"t": time.time()}
+
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
         def do_GET(self):
+            last_activity["t"] = time.time()
             name = os.path.basename(urllib.parse.urlparse(self.path).path)
             body = pipe.read(name)
             if body is None:
@@ -2797,6 +2930,10 @@ def _serve_local(path: str, args) -> int:
     try:
         while True:
             time.sleep(1)
+            if (args.idle_timeout
+                    and time.time() - last_activity["t"] > args.idle_timeout):
+                log("idle timeout, exiting")
+                break
     except KeyboardInterrupt:
         pass
     finally:
@@ -3196,6 +3333,11 @@ def main() -> int:
             return rc
 
     proxy = args.proxy if args.proxy else detect_proxy()
+    if proxy and _is_local_host(args.url):
+        # Loopback/LAN source (e.g. a local MyTube server): the global proxy can't
+        # reach it (and must not). Bypass for both extraction and relay.
+        log("local-network source -> proxy bypass")
+        proxy = None
     if proxy:
         log("proxy: " + proxy)
 
@@ -3215,6 +3357,25 @@ def main() -> int:
 
     proxy = info["proxy"]  # relay through the same path that extracted (IP-signed URLs)
     log("relay path: " + (proxy or "direct"))
+
+    # Enhance + progressive-only source (native HLS/DASH unavailable, e.g. PornHub
+    # HLS 410 on every proxy exit): download the IP-signed progressive whole to a
+    # local file, then enhance it locally. vtenhance's AVAssetReader can't stream a
+    # remote/IP-signed URL and progressive is width-less, so streaming enhance is
+    # impossible; a local file gives enhanced playback instead of dropping to raw.
+    if (info.get("mode") == "progressive"
+            and args.enhance in ("speed", "quality", "max", "photo")
+            and _vtenhance_path()):
+        tmp = _download_progressive_local(proxy, info.get("media") or {})
+        if tmp:
+            try:
+                return _serve_local(tmp, args)
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        log("progressive download failed -> raw relay")
 
     playlists: dict[str, str] = {}
     upstreams: dict[str, Upstream] = {}
