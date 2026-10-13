@@ -3138,7 +3138,15 @@ def _serve_ingest(args) -> int:
         while True:
             time.sleep(1)
             if state["err"]:
-                log("ingest error: " + state["err"]); break
+                log("ingest error: " + state["err"])
+                # Preserve the reconstructed file head for diagnosis (codec/profile).
+                try:
+                    import shutil as _sh
+                    _sh.copy(src, "/tmp/ingest-debug.mp4")
+                    log("ingest: saved reconstructed head to /tmp/ingest-debug.mp4")
+                except OSError:
+                    pass
+                break
             if (args.idle_timeout and state["pipe"] is not None
                     and time.time() - last_activity["t"] > args.idle_timeout):
                 log("idle timeout, exiting"); break
