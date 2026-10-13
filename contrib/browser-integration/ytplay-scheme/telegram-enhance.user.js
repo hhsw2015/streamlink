@@ -310,5 +310,5 @@
     }
   }, 800);
 
-  log("loaded; ingest port", INGEST_PORT, "tier", ENHANCE);
+  log("loaded v2 (anchor+chunk); ingest port", INGEST_PORT, "tier", ENHANCE);
 })();

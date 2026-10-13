@@ -2941,11 +2941,13 @@ def _serve_ingest(args) -> int:
         def log_message(self, *a): pass
 
         def do_OPTIONS(self):
+            log(f"ingest <- OPTIONS {self.path} (preflight from {self.headers.get('Origin','?')})")
             self.send_response(204); _cors(self); self.send_header("Content-Length", "0")
             self.end_headers()
 
         def do_POST(self):
             last_activity["t"] = time.time()
+            log(f"ingest <- POST {self.path} (len={self.headers.get('Content-Length','?')})")
             # The page pushes the file as a sequence of in-order fixed-size chunk
             # POSTs (a streaming body only works over HTTP/2; this server is 1.1).
             # Metadata rides the query string (no custom headers -> no extra CORS
@@ -3016,6 +3018,7 @@ def _serve_ingest(args) -> int:
 
         def do_GET(self):
             last_activity["t"] = time.time()
+            log(f"ingest <- GET {self.path}")
             name = os.path.basename(urllib.parse.urlparse(self.path).path)
             pipe = state["pipe"]
             body = pipe.read(name) if pipe else None
