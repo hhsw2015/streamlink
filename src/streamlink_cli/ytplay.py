@@ -2696,16 +2696,22 @@ def _ffprobe_props(path: str) -> tuple[int, int, float, float]:
         return 0, 0, 30.0, 0.0
 
 
-def _vt_tier_flags(enhance: str, src_h: int) -> list[str]:
-    """vtenhance flags for a tier on a local file (SR only - simple & reliable;
-    fps2x/temporal belong to the streaming path, not this MVP)."""
+def _vt_tier_flags(enhance: str, src_h: int, src_fps: float = 0.0) -> list[str]:
+    """vtenhance flags for a tier on a local file. SR per tier, plus frame
+    interpolation for a low-fps source (24/30 -> 48/60) so motion is smooth like
+    the streaming path - CNN tiers use the GPU flow-warp (SR-first VFI), MetalFX
+    uses Apple FRC."""
     if enhance in ("max", "photo"):
         fam = "fsrcnnx" if enhance == "photo" else "artcnn"
         model = _ane_model_path(src_h, fam)
-        return ["--cunny", "--ane", model] if model else ["--cunny"]
-    if enhance == "quality":
-        return ["--cunny"]
-    return []  # speed = MetalFX (vtenhance default)
+        flags = ["--cunny", "--ane", model] if model else ["--cunny"]
+    elif enhance == "quality":
+        flags = ["--cunny"]
+    else:
+        flags = []  # speed = MetalFX (vtenhance default)
+    if 0 < src_fps < 35:   # double a 24/30fps source; >=35 already smooth
+        flags = flags + (["--fps2x"] if not flags else ["--fps2x-warp"])
+    return flags
 
 
 def _is_dovi_p5p7(path: str) -> bool:
@@ -2951,7 +2957,8 @@ def _serve_ingest(args) -> int:
     src = os.path.join(tmp_dir, "insrc.mp4")
     open(src, "wb").close()
     state = {"done": False, "bytes": 0, "pipe": None, "err": None,
-             "t0": None, "total": 0, "starting": False}
+             "t0": None, "total": 0, "starting": False,
+             "player_t": 0.0, "served_t": 0.0}
     last_activity = {"t": time.time()}
     enhance = args.enhance if args.enhance in ("speed", "quality", "max", "photo") else "photo"
 
@@ -2986,15 +2993,16 @@ def _serve_ingest(args) -> int:
             ow, oh = plan if plan else (w * 2, h * 2)
             if _is_dovi_p5p7(src):
                 tier = enhance if enhance in ("max", "photo", "quality") else "quality"
-                vt_flags = _vt_tier_flags(tier, h)
+                vt_flags = _vt_tier_flags(tier, h, fps)
                 log("ingest: Dolby Vision P5/P7 -> in-process BT.2020 PQ reconstruction")
             else:
-                vt_flags = _vt_tier_flags(enhance, h)
+                vt_flags = _vt_tier_flags(enhance, h, fps)
             log(f"ingest {w}x{h}@{fps:g} -> {ow}x{oh} {enhance} (edge-play, {dur:.0f}s)")
             pipe = LocalEnhancePipe(src, ow, oh, dur, vt_flags, growing=True)
             if not pipe.wait_ready():
                 pipe.cleanup(); state["err"] = "enhancer produced no output"; return
             state["pipe"] = pipe
+            state["served_t"] = time.time()   # serving started; idle clock begins
             if not args.no_open:
                 port = srv.server_address[1]
                 launch_player(args.player, f"http://127.0.0.1:{port}/enh/index.m3u8",
@@ -3112,6 +3120,7 @@ def _serve_ingest(args) -> int:
 
         def do_GET(self):
             last_activity["t"] = time.time()
+            state["player_t"] = time.time()   # a GET = the player is alive/watching
             name = os.path.basename(urllib.parse.urlparse(self.path).path)
             pipe = state["pipe"]
             body = pipe.read(name) if pipe else None
@@ -3147,9 +3156,18 @@ def _serve_ingest(args) -> int:
                 except OSError:
                     pass
                 break
-            if (args.idle_timeout and state["pipe"] is not None
-                    and time.time() - last_activity["t"] > args.idle_timeout):
-                log("idle timeout, exiting"); break
+            # Stop on PLAYER inactivity, not upload: the browser keeps POSTing the
+            # download, so an upload-based timer would never fire. Closing the player
+            # (no segment GETs) must stop the download + free the GPU/temp files.
+            if args.idle_timeout and state["pipe"] is not None:
+                now = time.time()
+                if state["player_t"] > 0:
+                    if now - state["player_t"] > args.idle_timeout:
+                        log("player closed (no segment requests) -> stop download, release")
+                        break
+                elif now - state["served_t"] > 60:
+                    log("player never connected -> exit")
+                    break
     except KeyboardInterrupt:
         pass
     finally:
@@ -3176,10 +3194,10 @@ def _serve_local(path: str, args) -> int:
     # the RPU path is 10-bit/NV12 (MetalFX is BGRA8 SDR).
     if _is_dovi_p5p7(path):
         dv_tier = args.enhance if args.enhance in ("max", "photo", "quality") else "quality"
-        vt_flags = _vt_tier_flags(dv_tier, h)
+        vt_flags = _vt_tier_flags(dv_tier, h, fps)
         log("local: Dolby Vision P5/P7 -> in-process BT.2020 PQ reconstruction")
     else:
-        vt_flags = _vt_tier_flags(args.enhance, h)
+        vt_flags = _vt_tier_flags(args.enhance, h, fps)
     log(f"local {w}x{h}@{fps:g} -> {ow}x{oh} {args.enhance} (instant open, no extraction)")
     pipe = LocalEnhancePipe(path, ow, oh, dur, vt_flags)
     if not pipe.wait_ready():

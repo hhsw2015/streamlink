@@ -166,31 +166,40 @@
     };
 
     // Parallel-download [a,b) and push it in order (final=1 on the last chunk).
+    // `aborted` stops BOTH the download lanes and the pusher the moment the ingest
+    // server goes away (player closed -> server exits -> POST fails): no point
+    // keep pulling gigabytes from Telegram once there's nothing to feed.
     const streamRange = async (a, b, total) => {
       const n = Math.ceil((b - a) / CHUNK);
       const ready = new Map();
-      let nextToClaim = 0, pushPos = 0, waiterIdx = -1, waiterResolve = null;
+      let nextToClaim = 0, pushPos = 0, aborted = false;
       const WINDOW = LANES * 3;
       const lane = async () => {
-        while (true) {
-          while (nextToClaim - pushPos > WINDOW) await new Promise(r => setTimeout(r, 20));
+        while (!aborted) {
+          while (!aborted && nextToClaim - pushPos > WINDOW) await new Promise(r => setTimeout(r, 20));
+          if (aborted) return;
           const i = nextToClaim++;
           if (i >= n) return;
-          const s = a + i * CHUNK, e = Math.min(s + CHUNK, b);
-          ready.set(i, await fetchRange(s, e));
-          if (i === waiterIdx && waiterResolve) { const r = waiterResolve; waiterResolve = null; r(); }
+          try { ready.set(i, await fetchRange(a + i * CHUNK, Math.min(a + (i + 1) * CHUNK, b))); }
+          catch (e) { aborted = true; return; }   // Telegram fetch failed -> stop
         }
       };
       const lanesDone = Promise.all(Array.from({ length: Math.min(LANES, n) }, lane));
-      for (let i = 0; i < n; i++) {
-        pushPos = i;
-        while (!ready.has(i)) {
-          await new Promise(res => { waiterIdx = i; waiterResolve = res; if (ready.has(i)) { waiterResolve = null; res(); } });
+      try {
+        for (let i = 0; i < n; i++) {
+          pushPos = i;
+          while (!ready.has(i)) {
+            if (aborted) throw new Error("download aborted");
+            await new Promise(r => setTimeout(r, 30));   // lanes fill `ready`
+          }
+          const data = ready.get(i); ready.delete(i);
+          try { await pushChunk(data, a + i * CHUNK, total, i === n - 1); }
+          catch (e) { aborted = true; throw e; }   // server gone -> stop lanes + bubble up
         }
-        const data = ready.get(i); ready.delete(i);
-        await pushChunk(data, a + i * CHUNK, total, i === n - 1);
+      } finally {
+        aborted = true;                 // guarantee the lanes unwind on any exit
+        await lanesDone.catch(() => {});
       }
-      await lanesDone;
     };
 
     // Parse top-level mp4 boxes from the file head: find ftyp / mdat / moov and
