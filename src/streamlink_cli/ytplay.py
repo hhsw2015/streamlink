@@ -2755,8 +2755,11 @@ class LocalEnhancePipe(EnhancePipe):
         cmd = ([_vtenhance_path() or "vtenhance", path, self.dir, "--hls",
                 "--seg-interval", str(self.SEG), "--scale", f"{out_w}x{out_h}",
                 "--audio"] + (["--growing"] if growing else []) + vt_flags)
+        # Capture vtenhance stderr to a stable path so a crash (rc!=0) is diagnosable.
+        self._errlog = "/tmp/vtenhance-last.log"
+        _errf = open(self._errlog, "wb")
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                     stdout=subprocess.DEVNULL, stderr=_errf)
         self.yv = self.ya = None   # no yt-dlp source for a local file
         threading.Thread(target=self._wait, daemon=True).start()
 
