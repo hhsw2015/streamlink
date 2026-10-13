@@ -133,14 +133,19 @@
       if (!r.ok) throw new Error("ingest POST " + r.status);
     };
 
-    // Fetch an exact byte range [a,b) assembling 512KB-capped sub-responses.
+    // Fetch an exact byte range [a,b). Telegram's getFile (behind the progressive
+    // SW URL) requires the Range START to be 4096-aligned, else OFFSET_INVALID, so
+    // request aligned 512KB pieces and trim the padding to return exactly [a,b).
+    const ALIGN = 4096, PIECE = 512 * 1024;
     const fetchRange = async (a, b) => {
       const parts = []; let pos = a;
       while (pos < b) {
+        const reqStart = pos - (pos % ALIGN);          // align down
+        const reqEnd = Math.min(reqStart + PIECE, b);  // <=512KB, within one block
         let got = null;
         for (let attempt = 0; attempt < 5; attempt++) {
           try {
-            const r = await fetch(url, { headers: { Range: `bytes=${pos}-${b - 1}` } });
+            const r = await fetch(url, { headers: { Range: `bytes=${reqStart}-${reqEnd - 1}` } });
             if (![200, 206].includes(r.status)) throw new Error("status " + r.status);
             got = new Uint8Array(await r.arrayBuffer()); break;
           } catch (e) {
@@ -149,9 +154,12 @@
           }
         }
         if (!got || got.length === 0) break;
-        parts.push(got); pos += got.length;
+        const skip = pos - reqStart;                   // drop the alignment padding
+        const useful = got.subarray(skip, Math.min(got.length, b - reqStart));
+        if (useful.length === 0) break;
+        parts.push(useful); pos += useful.length;
       }
-      if (parts.length === 1) return parts[0];
+      if (parts.length === 1) return new Uint8Array(parts[0]);
       const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
       let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
       return out;
