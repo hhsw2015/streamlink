@@ -21,8 +21,9 @@
   // Max-speed download: many parallel Range connections. Download MUST outpace 1x
   // playback or it stutters, so we saturate the link. Telegram's service worker
   // serves each Range from the DC; 8 lanes * 4 MB is a good saturation point.
-  const LANES = 8;
-  const CHUNK = 4 << 20;              // 4 MB per range request
+  const LANES = 16;                  // concurrent range connections (max speed)
+  const CHUNK = 4 << 20;             // 4 MB push window (assembled from ~512KB
+                                     // sub-reads; Telegram caps each range response)
 
   const log = (...a) => console.log("[tg-enhance]", ...a);
 
@@ -45,14 +46,16 @@
     if (ms) toast._t = setTimeout(() => { toastEl.style.display = "none"; }, ms);
   };
 
-  // --- fire a custom scheme WITHOUT navigating the page (a hidden iframe;
-  // location.href can interrupt the page's JS / in-flight fetches) -----------
+  // --- fire a custom scheme via an anchor click (an iframe is blocked by
+  // Telegram's CSP frame-src; location.href can interrupt the page). MUST be
+  // called inside the user gesture (external-protocol launch is gesture-gated). --
   const fireScheme = (uri) => {
-    const f = document.createElement("iframe");
-    f.style.display = "none";
-    f.src = uri;
-    document.body.appendChild(f);
-    setTimeout(() => f.remove(), 2000);
+    const a = document.createElement("a");
+    a.href = uri;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 1000);
   };
 
   // --- wait for the ingest server (ytplay --ingest) to come up -------------
@@ -112,8 +115,8 @@
     log("enhance play:", url);
     toast("启动增强管线…");
 
-    // 1. start the native ingest server (iframe, so the page/fetches aren't disturbed)
-    fireScheme(`ytplay://ingest?enhance=${ENHANCE}&player=${PLAYER}`);
+    // The scheme was already fired in the click handler (within the gesture).
+    // Wait for the ingest server to come up.
     if (!(await serverReady())) {
       toast("ytplay 没启动,YtplayScheme.app 装了吗?", 5000);
       return;
@@ -151,27 +154,47 @@
 
       const nChunks = Math.ceil(size / CHUNK);
       const ready = new Map();        // index -> Uint8Array (downloaded, awaiting push)
-      let nextToClaim = 0;
+      let nextToClaim = 0, pushPos = 0;
       let waiterIdx = -1, waiterResolve = null;
+      const WINDOW = LANES * 3;        // bound read-ahead (memory) for big files
 
+      // Fetch EXACTLY the [i*CHUNK, +CHUNK) window. Telegram caps each Range
+      // response at ~512KB, so one request can return fewer bytes than asked -
+      // keep requesting the remainder until the window is full (or EOF).
       const fetchChunk = async (i) => {
         const start = i * CHUNK;
-        const end = Math.min(start + CHUNK, size) - 1;
-        for (let attempt = 0; attempt < 5; attempt++) {
-          try {
-            const r = await fetch(url, { headers: { Range: `bytes=${start}-${end}` } });
-            if (![200, 206].includes(r.status)) throw new Error("status " + r.status);
-            return new Uint8Array(await r.arrayBuffer());
-          } catch (e) {
-            if (attempt === 4) throw e;
-            await new Promise((res) => setTimeout(res, 300 * (attempt + 1)));
+        const stop = Math.min(start + CHUNK, size);   // exclusive
+        const parts = [];
+        let pos = start;
+        while (pos < stop) {
+          let got = null;
+          for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+              const r = await fetch(url, { headers: { Range: `bytes=${pos}-${stop - 1}` } });
+              if (![200, 206].includes(r.status)) throw new Error("status " + r.status);
+              got = new Uint8Array(await r.arrayBuffer());
+              break;
+            } catch (e) {
+              if (attempt === 4) throw e;
+              await new Promise((res) => setTimeout(res, 300 * (attempt + 1)));
+            }
           }
+          if (!got || got.length === 0) break;   // no progress -> EOF
+          parts.push(got); pos += got.length;
         }
+        if (parts.length === 1) return parts[0];
+        const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+        let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+        return out;
       };
 
-      // parallel download lanes fill `ready` ahead of the sequential pusher
+      // parallel download lanes fill `ready` ahead of the sequential pusher,
+      // bounded by WINDOW so a 3.7GB file doesn't buffer unboundedly in memory.
       const lane = async () => {
         while (true) {
+          while (nextToClaim - pushPos > WINDOW) {
+            await new Promise((res) => setTimeout(res, 20));
+          }
           const i = nextToClaim++;
           if (i >= nChunks) return;
           ready.set(i, await fetchChunk(i));
@@ -185,6 +208,7 @@
 
       // in-order pusher: POST chunk i once downloaded, waiting if a lane is behind
       for (let i = 0; i < nChunks; i++) {
+        pushPos = i;
         while (!ready.has(i)) {
           await new Promise((res) => {
             waiterIdx = i; waiterResolve = res;
@@ -244,7 +268,10 @@
     b.style.fontSize = "18px";
     b.onclick = (e) => {
       e.preventDefault(); e.stopPropagation();
-      enhancePlay();   // resolves the source fresh (with retry) at click time
+      // Fire the scheme NOW, inside the user gesture (external-protocol launch is
+      // gesture-gated; an await first would lose the gesture and the launch).
+      fireScheme(`ytplay://ingest?enhance=${ENHANCE}&player=${PLAYER}`);
+      enhancePlay();   // resolves the source + pushes (async)
     };
     return b;
   };
