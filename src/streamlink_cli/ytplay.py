@@ -2900,6 +2900,7 @@ def _serve_ingest(args) -> int:
         h.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         h.send_header("Access-Control-Allow-Headers", "Content-Type, Content-Range, X-Total-Size")
         h.send_header("Access-Control-Allow-Private-Network", "true")
+        h.send_header("Access-Control-Max-Age", "86400")  # cache preflight (per-chunk POST)
 
     def _try_start_enhance():
         # Start once the moov head + buffer is readable (ffprobe gives real dims).
@@ -2945,18 +2946,22 @@ def _serve_ingest(args) -> int:
 
         def do_POST(self):
             last_activity["t"] = time.time()
-            # Total file size (for the slow-download rate check) - the page knows it
-            # from its Range probe and sends it; without it we just wait for the full
-            # download before enhancing.
+            # The page pushes the file as a sequence of in-order fixed-size chunk
+            # POSTs (a streaming body only works over HTTP/2; this server is 1.1).
+            # Metadata rides the query string (no custom headers -> no extra CORS
+            # preflight): ?offset=&total=&final=1. total feeds the slow-download
+            # rate check; final=1 marks the last chunk.
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            is_final = (qs.get("final", ["0"])[0] in ("1", "true")
+                        or self.headers.get("X-Ingest-Final", "").lower() in ("1", "true"))
             try:
-                ts = int(self.headers.get("X-Total-Size") or 0)
+                ts = int(qs.get("total", [self.headers.get("X-Total-Size") or 0])[0])
                 if ts > 0:
                     state["total"] = ts
-            except ValueError:
+            except (ValueError, TypeError):
                 pass
-            # Append the request body (in file order) to the growing file. A browser
-            # streaming fetch body is Transfer-Encoding: chunked (fetch forbids
-            # setting Content-Length), so dechunk it - reading the raw socket would
+            # Append the request body (in file order) to the growing file. A chunked
+            # body (streaming client) is dechunked - reading the raw socket would
             # splice chunk-size framing into the video and corrupt it.
             te = (self.headers.get("Transfer-Encoding") or "").lower()
             with open(src, "ab") as f:
@@ -2997,14 +3002,14 @@ def _serve_ingest(args) -> int:
                         _sink(buf)
                         if remaining is not None:
                             remaining -= len(buf)
-            # Contract: ONE (streaming) POST carries the whole file in order, so its
-            # end = download complete. Touch the sentinel so a --growing vtenhance
-            # knows this is real EOF (not an underrun to wait through).
-            state["done"] = True
-            try:
-                open(src + ".done", "w").close()
-            except OSError:
-                pass
+            # Mark complete only on the FINAL chunk (not every POST) so a --growing
+            # vtenhance knows real EOF vs an underrun to wait through.
+            if is_final:
+                state["done"] = True
+                try:
+                    open(src + ".done", "w").close()
+                except OSError:
+                    pass
             _try_start_enhance()
             self.send_response(200); _cors(self)
             self.send_header("Content-Length", "0"); self.end_headers()

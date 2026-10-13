@@ -89,90 +89,81 @@
       return;
     }
 
-    // 2. blob: src = already in memory -> just push it whole
-    if (url.startsWith("blob:")) {
-      const buf = await (await fetch(url)).arrayBuffer();
-      await fetch(`${INGEST}/ingest`, {
-        method: "POST", headers: { "X-Ingest-Final": "1" }, body: buf,
-      });
-      log("pushed blob", buf.byteLength, "bytes");
-      return;
-    }
+    // Push one fixed-size chunk as a NORMAL POST (metadata in the query string,
+    // no custom headers, body is a sized ArrayBuffer -> Content-Length set). A
+    // streaming ReadableStream body only works over HTTP/2; our local server is
+    // HTTP/1.1, where Chrome refuses it with "Failed to fetch".
+    const pushChunk = async (buf, offset, total, final) => {
+      const u = `${INGEST}/ingest?offset=${offset}&total=${total}${final ? "&final=1" : ""}`;
+      const r = await fetch(u, { method: "POST", body: buf });
+      if (!r.ok) throw new Error("ingest POST " + r.status);
+    };
 
-    // 3. sized Range download
-    const { size, ranged } = await probeSize(url);
-    if (!ranged || !size) {
-      // no Range -> single sequential fetch piped straight to ingest
-      const resp = await fetch(url);
-      await fetch(`${INGEST}/ingest`, {
-        method: "POST", headers: { "X-Ingest-Final": "1" }, body: resp.body,
-        duplex: "half",
-      });
-      log("pushed (no-range) done");
-      return;
-    }
-    log(`size ${(size / 1e6).toFixed(1)} MB, ${LANES} lanes x ${CHUNK >> 20}MB`);
+    try {
+      // 2. blob: src = already in memory -> push it whole
+      if (url.startsWith("blob:")) {
+        const buf = new Uint8Array(await (await fetch(url)).arrayBuffer());
+        await pushChunk(buf, 0, buf.length, true);
+        log("pushed blob", buf.length, "bytes");
+        return;
+      }
 
-    const nChunks = Math.ceil(size / CHUNK);
-    const ready = new Map();          // index -> Uint8Array (completed, awaiting order)
-    let nextToClaim = 0;              // next chunk index a lane may fetch
-    let nextToEmit = 0;              // next chunk index the writer must emit
-    let emitResolve = null;           // wake the writer when a needed chunk lands
+      // 3. sized Range download
+      const { size, ranged } = await probeSize(url);
+      if (!ranged || !size) {
+        const buf = new Uint8Array(await (await fetch(url)).arrayBuffer());
+        await pushChunk(buf, 0, buf.length, true);
+        log("pushed (no-range)", buf.length, "bytes");
+        return;
+      }
+      log(`size ${(size / 1e6).toFixed(1)} MB, ${LANES} lanes x ${CHUNK >> 20}MB`);
 
-    const fetchChunk = async (i) => {
-      const start = i * CHUNK;
-      const end = Math.min(start + CHUNK, size) - 1;
-      for (let attempt = 0; attempt < 5; attempt++) {
-        try {
-          const r = await fetch(url, { headers: { Range: `bytes=${start}-${end}` } });
-          if (![200, 206].includes(r.status)) throw new Error("status " + r.status);
-          return new Uint8Array(await r.arrayBuffer());
-        } catch (e) {
-          if (attempt === 4) throw e;
-          await new Promise((res) => setTimeout(res, 300 * (attempt + 1)));
+      const nChunks = Math.ceil(size / CHUNK);
+      const ready = new Map();        // index -> Uint8Array (downloaded, awaiting push)
+      let nextToClaim = 0;
+      let waiterIdx = -1, waiterResolve = null;
+
+      const fetchChunk = async (i) => {
+        const start = i * CHUNK;
+        const end = Math.min(start + CHUNK, size) - 1;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            const r = await fetch(url, { headers: { Range: `bytes=${start}-${end}` } });
+            if (![200, 206].includes(r.status)) throw new Error("status " + r.status);
+            return new Uint8Array(await r.arrayBuffer());
+          } catch (e) {
+            if (attempt === 4) throw e;
+            await new Promise((res) => setTimeout(res, 300 * (attempt + 1)));
+          }
         }
-      }
-    };
+      };
 
-    // lanes: each grabs the next unclaimed chunk until exhausted
-    const lane = async () => {
-      while (true) {
-        const i = nextToClaim++;
-        if (i >= nChunks) return;
-        const data = await fetchChunk(i);
-        ready.set(i, data);
-        if (i === nextToEmit && emitResolve) { const r = emitResolve; emitResolve = null; r(); }
-      }
-    };
-    const lanes = Array.from({ length: Math.min(LANES, nChunks) }, lane);
-    const lanesDone = Promise.all(lanes);
+      // parallel download lanes fill `ready` ahead of the sequential pusher
+      const lane = async () => {
+        while (true) {
+          const i = nextToClaim++;
+          if (i >= nChunks) return;
+          ready.set(i, await fetchChunk(i));
+          if (i === waiterIdx && waiterResolve) {
+            const r = waiterResolve; waiterResolve = null; r();
+          }
+        }
+      };
+      const lanesDone = Promise.all(
+        Array.from({ length: Math.min(LANES, nChunks) }, lane));
 
-    // writer: a ReadableStream that emits chunks strictly in order as they land
-    const body = new ReadableStream({
-      async pull(controller) {
-        while (!ready.has(nextToEmit)) {
-          if (nextToEmit >= nChunks) { controller.close(); return; }
-          // Register the waiter, then re-check synchronously inside the executor:
-          // a lane may have landed nextToEmit between the while-check and here,
-          // which would otherwise hang the writer forever.
+      // in-order pusher: POST chunk i once downloaded, waiting if a lane is behind
+      for (let i = 0; i < nChunks; i++) {
+        while (!ready.has(i)) {
           await new Promise((res) => {
-            emitResolve = res;
-            if (ready.has(nextToEmit)) { emitResolve = null; res(); }
+            waiterIdx = i; waiterResolve = res;
+            if (ready.has(i)) { waiterResolve = null; res(); }
           });
         }
-        const data = ready.get(nextToEmit);
-        ready.delete(nextToEmit);
-        controller.enqueue(data);
-        nextToEmit++;
-        if (nextToEmit >= nChunks) controller.close();
-      },
-    });
-
-    const post = fetch(`${INGEST}/ingest`, {
-      method: "POST", headers: { "X-Ingest-Final": "1" }, body, duplex: "half",
-    });
-    try {
-      await Promise.all([lanesDone, post]);
+        const data = ready.get(i); ready.delete(i);
+        await pushChunk(data, i * CHUNK, size, i === nChunks - 1);
+      }
+      await lanesDone;
       log("download + push complete");
     } catch (e) {
       log("ingest push failed:", e);
