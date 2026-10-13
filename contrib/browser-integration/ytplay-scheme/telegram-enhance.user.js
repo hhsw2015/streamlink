@@ -55,7 +55,19 @@
   };
 
   // --- parallel, in-order download -> single streaming POST to /ingest ----
+  let busy = false;   // debounce: a second click must not respawn/kill an active run
   const enhancePlay = async () => {
+    if (busy) { log("already starting; ignoring repeat click"); return; }
+    busy = true;
+    try {
+      await _enhancePlay();
+    } finally {
+      // keep busy for a moment after so the scheme's kill+respawn can't race a
+      // rapid second click, then release.
+      setTimeout(() => { busy = false; }, 3000);
+    }
+  };
+  const _enhancePlay = async () => {
     // The <video> src often appears only once playback has started, so resolve
     // with a short retry before giving up.
     let rawUrl = currentVideoURL();

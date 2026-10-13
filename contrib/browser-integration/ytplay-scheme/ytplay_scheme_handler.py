@@ -10,8 +10,10 @@ craft this URL, so nothing from it may become an arbitrary argument.
 """
 import datetime
 import os
+import socket
 import subprocess
 import sys
+import time
 import urllib.parse
 
 LOG = "/tmp/streamlink-scheme-handler.log"
@@ -60,12 +62,31 @@ def main() -> int:
     if action == "ingest":
         # Browser-pushed stream (e.g. Telegram web): start the ingest server on a
         # fixed port; the page then POSTs the media to http://127.0.0.1:<port>/ingest.
-        # Kill any stale ingest first so a new play always wins the port.
+        # A new video wants a fresh server, so kill any stale ingest first - but
+        # WAIT for it to release the port before spawning, or the new bind races it
+        # ("Address already in use") and the server dies, leaving the POST with
+        # nothing to hit.
         port = one("port", str(INGEST_PORT))
         if not port.isdigit():
             port = str(INGEST_PORT)
-        subprocess.run(["pkill", "-f", "streamlink-ytplay .* --ingest"],
-                       capture_output=True)
+        pnum = int(port)
+
+        def _port_free() -> bool:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                s.bind(("127.0.0.1", pnum)); return True
+            except OSError:
+                return False
+            finally:
+                s.close()
+
+        if not _port_free():
+            subprocess.run(["pkill", "-9", "-f", "streamlink-ytplay .* --ingest"],
+                           capture_output=True)
+            for _ in range(40):          # up to ~4s for the old server to exit
+                if _port_free():
+                    break
+                time.sleep(0.1)
         cmd = ["streamlink-ytplay", "x", "--ingest", "--port", port,
                "--idle-timeout", "120", "--player", player, "--enhance", enhance]
         logline = f"[ytplay-scheme] INGEST port={port} enhance={enhance} player={player}"
