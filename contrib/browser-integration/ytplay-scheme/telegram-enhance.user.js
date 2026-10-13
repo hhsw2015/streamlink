@@ -55,8 +55,18 @@
   };
 
   // --- parallel, in-order download -> single streaming POST to /ingest ----
-  const enhancePlay = async (rawUrl) => {
-    if (!rawUrl) { alert("No video source found"); return; }
+  const enhancePlay = async () => {
+    // The <video> src often appears only once playback has started, so resolve
+    // with a short retry before giving up.
+    let rawUrl = currentVideoURL();
+    for (let i = 0; i < 12 && !rawUrl; i++) {
+      await new Promise((r) => setTimeout(r, 300));
+      rawUrl = currentVideoURL();
+    }
+    if (!rawUrl) {
+      alert("未找到视频源。请先让视频开始播放(点一下播放),再点 ✨。");
+      return;
+    }
     const url = new URL(rawUrl, location.href).href;
     log("enhance play:", url);
 
@@ -158,38 +168,72 @@
     }
   };
 
+  // --- resolve the open media-viewer video's URL, re-queried fresh at click ---
+  // Telegram has two web clients with different DOM (K = /k/, the default;
+  // A/Z = /a/). Try both; read the live <video> (K uses .src, A/Z currentSrc).
+  const currentVideoURL = () => {
+    const kv = document.querySelector(
+      ".media-viewer-whole .media-viewer-movers .media-viewer-aspecter video");
+    if (kv) {
+      const u = kv.src || kv.currentSrc || kv.querySelector("source")?.src;
+      if (u) return u;
+    }
+    const av = document.querySelector("#MediaViewer .VideoPlayer video");
+    if (av) {
+      const u = av.currentSrc || av.src || av.querySelector("source")?.src;
+      if (u) return u;
+    }
+    return null;
+  };
+
   // --- button injection (mirrors the Telegram Media Downloader hooks) ------
   const ICON = "✨";
-  const makeBtn = (onclick) => {
+  const makeBtn = () => {
     const b = document.createElement("button");
-    b.className = "Button smaller translucent-white round tel-enhance";
+    // Classes for BOTH clients so it fits either control bar; harmless extras.
+    b.className = "tel-enhance Button smaller translucent-white round "
+      + "btn-icon default__button";
     b.type = "button";
     b.title = "Enhance Play (ytplay)";
     b.setAttribute("aria-label", "Enhance Play");
     b.textContent = ICON;
     b.style.fontSize = "18px";
-    b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); onclick(); };
+    b.onclick = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      enhancePlay();   // resolves the source fresh (with retry) at click time
+    };
     return b;
   };
 
   setInterval(() => {
-    // media viewer (full-screen video) - webk/webz "A" client
-    const mediaContainer = document.querySelector("#MediaViewer .MediaViewerSlides")
-      || document.querySelector(".media-viewer-whole");
-    const videoPlayer = document.querySelector(".VideoPlayer, .media-viewer-movers .ckin__player");
-    const vid = videoPlayer && videoPlayer.querySelector("video");
-    if (vid) {
-      // controls bar
-      const controls = videoPlayer.querySelector(".VideoPlayerControls .buttons, .ckin__controls");
+    // --- webk "K" client (default: web.telegram.org/k/) ---
+    const kWhole = document.querySelector(".media-viewer-whole");
+    if (kWhole) {
+      const kAspect = kWhole.querySelector(".media-viewer-movers .media-viewer-aspecter");
+      const kRight = kAspect && kAspect.querySelector(
+        ".ckin__player .default__controls.ckin__controls .bottom-controls .right-controls");
+      if (kRight && !kRight.querySelector("button.tel-enhance")) {
+        kRight.prepend(makeBtn());
+      }
+      // topbar fallback (video present but player controls not up yet)
+      const kBar = kWhole.querySelector(".media-viewer-topbar .media-viewer-buttons");
+      if (kBar && !kBar.querySelector("button.tel-enhance")
+          && kAspect && kAspect.querySelector("video")) {
+        kBar.prepend(makeBtn());
+      }
+    }
+    // --- webz "A/Z" client (web.telegram.org/a/) ---
+    const aPlayer = document.querySelector("#MediaViewer .VideoPlayer");
+    if (aPlayer) {
+      const controls = aPlayer.querySelector(".VideoPlayerControls .buttons");
       if (controls && !controls.querySelector("button.tel-enhance")) {
-        const btn = makeBtn(() => enhancePlay(vid.currentSrc || vid.src));
+        const btn = makeBtn();
         const spacer = controls.querySelector(".spacer");
         if (spacer) spacer.after(btn); else controls.appendChild(btn);
       }
-      // top action bar
       const actions = document.querySelector("#MediaViewer .MediaViewerActions");
       if (actions && !actions.querySelector("button.tel-enhance")) {
-        actions.prepend(makeBtn(() => enhancePlay(vid.currentSrc || vid.src)));
+        actions.prepend(makeBtn());
       }
     }
   }, 800);
