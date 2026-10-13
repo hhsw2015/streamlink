@@ -2726,10 +2726,13 @@ def _vt_tier_flags(enhance: str, src_h: int, src_fps: float = 0.0,
     else:
         flags = list(NATIVE_TIERS.get(enhance, []))   # quality=--cunny, speed=[]
     ane = enhance in ("max", "photo") and ane_model is not None
-    warp = ane and 0 < src_fps < 35           # SR-first VFI on the ANE-freed GPU
+    warp = ane and 0 < src_fps < 35 and not os.environ.get("YTPLAY_NO_WARP")
     if warp:
-        flags += ["--fps2x-warp"]
-    dn = _denoise_strength(src) if (src and enhance in ("quality", "max", "photo")) else 0.0
+        flags += ["--fps2x-warp"]            # SR-first VFI on the ANE-freed GPU
+    # denoise gated on fps like the streaming path (temporal too slow above it)
+    temporal_ok = src_fps <= (61 if enhance in ("max", "photo") else 35)
+    dn = (_denoise_strength(src)
+          if (src and enhance in ("quality", "max", "photo") and temporal_ok) else 0.0)
     has_temporal = False
     if dn > 0:
         flags += ["--denoise", f"{dn:.3f}", "--temporal", "0.4" if enhance == "photo" else "0.7"]
@@ -2785,9 +2788,14 @@ class LocalEnhancePipe(EnhancePipe):
         # --growing: the input file is still being written (edge-play). vtenhance
         # waits on a read underrun + resumes instead of aborting; EOF is the
         # "<path>.done" sentinel the caller touches when the download finishes.
+        # Match the streaming path's bitrate ladder (_vt_seg_flags): the CNN adds
+        # high-frequency detail a stingy bitrate would crush; local playback, so
+        # bandwidth is free. 40 Mbps for 4K, 24 for 1440p, 16 below.
+        mbit = 40 if out_h >= 2000 else 24 if out_h >= 1400 else 16
         cmd = ([_vtenhance_path() or "vtenhance", path, self.dir, "--hls",
                 "--seg-interval", str(self.SEG), "--scale", f"{out_w}x{out_h}",
-                "--audio"] + (["--growing"] if growing else []) + vt_flags)
+                "--bitrate", str(mbit), "--audio"]
+               + (["--growing"] if growing else []) + vt_flags)
         # Capture vtenhance stderr to a stable path so a crash (rc!=0) is diagnosable.
         self._errlog = "/tmp/vtenhance-last.log"
         _errf = open(self._errlog, "wb")
