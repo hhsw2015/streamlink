@@ -26,6 +26,35 @@
 
   const log = (...a) => console.log("[tg-enhance]", ...a);
 
+  // --- on-page status toast (so there's always visible feedback) -----------
+  let toastEl = null;
+  const toast = (msg, ms) => {
+    if (!toastEl) {
+      toastEl = document.createElement("div");
+      Object.assign(toastEl.style, {
+        position: "fixed", bottom: "24px", left: "50%", transform: "translateX(-50%)",
+        background: "rgba(0,0,0,.85)", color: "#fff", padding: "10px 16px",
+        borderRadius: "10px", font: "14px -apple-system,sans-serif", zIndex: 99999,
+        pointerEvents: "none", maxWidth: "80vw", textAlign: "center",
+      });
+      document.body.appendChild(toastEl);
+    }
+    toastEl.textContent = "✨ " + msg;
+    toastEl.style.display = "block";
+    if (toast._t) clearTimeout(toast._t);
+    if (ms) toast._t = setTimeout(() => { toastEl.style.display = "none"; }, ms);
+  };
+
+  // --- fire a custom scheme WITHOUT navigating the page (a hidden iframe;
+  // location.href can interrupt the page's JS / in-flight fetches) -----------
+  const fireScheme = (uri) => {
+    const f = document.createElement("iframe");
+    f.style.display = "none";
+    f.src = uri;
+    document.body.appendChild(f);
+    setTimeout(() => f.remove(), 2000);
+  };
+
   // --- wait for the ingest server (ytplay --ingest) to come up -------------
   const serverReady = async (timeoutMs = 8000) => {
     const deadline = Date.now() + timeoutMs;
@@ -76,18 +105,20 @@
       rawUrl = currentVideoURL();
     }
     if (!rawUrl) {
-      alert("未找到视频源。请先让视频开始播放(点一下播放),再点 ✨。");
+      toast("未找到视频源,请先让视频开始播放", 4000);
       return;
     }
     const url = new URL(rawUrl, location.href).href;
     log("enhance play:", url);
+    toast("启动增强管线…");
 
-    // 1. start the native ingest server
-    location.href = `ytplay://ingest?enhance=${ENHANCE}&player=${PLAYER}`;
+    // 1. start the native ingest server (iframe, so the page/fetches aren't disturbed)
+    fireScheme(`ytplay://ingest?enhance=${ENHANCE}&player=${PLAYER}`);
     if (!(await serverReady())) {
-      alert("ytplay ingest server did not start.\nIs YtplayScheme.app installed?");
+      toast("ytplay 没启动,YtplayScheme.app 装了吗?", 5000);
       return;
     }
+    toast("下载中…");
 
     // Push one fixed-size chunk as a NORMAL POST (metadata in the query string,
     // no custom headers, body is a sized ArrayBuffer -> Content-Length set). A
@@ -165,9 +196,10 @@
       }
       await lanesDone;
       log("download + push complete");
+      toast("已送入增强,SenPlayer 即将打开", 5000);
     } catch (e) {
       log("ingest push failed:", e);
-      alert("Enhance play failed: " + e.message);
+      toast("推流失败: " + e.message, 6000);
     }
   };
 
