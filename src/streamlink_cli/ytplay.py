@@ -2697,10 +2697,11 @@ def _ffprobe_props(path: str) -> tuple[int, int, float, float]:
 
 
 def _vt_tier_flags(enhance: str, src_h: int, src_fps: float = 0.0) -> list[str]:
-    """vtenhance flags for a tier on a local file. SR per tier, plus frame
-    interpolation for a low-fps source (24/30 -> 48/60) so motion is smooth like
-    the streaming path - CNN tiers use the GPU flow-warp (SR-first VFI), MetalFX
-    uses Apple FRC."""
+    """vtenhance flags for a tier on a local file. SR per tier, plus our GPU
+    flow-warp frame interpolation (SR-first VFI) for a low-fps source (24/30 ->
+    48/60) so motion is smooth like the streaming path. Warp operates on the CNN's
+    SR'd frames, so it only applies to the CNN tiers (quality/max/photo), never the
+    MetalFX speed tier - we do NOT use Apple's frame processor."""
     if enhance in ("max", "photo"):
         fam = "fsrcnnx" if enhance == "photo" else "artcnn"
         model = _ane_model_path(src_h, fam)
@@ -2708,9 +2709,9 @@ def _vt_tier_flags(enhance: str, src_h: int, src_fps: float = 0.0) -> list[str]:
     elif enhance == "quality":
         flags = ["--cunny"]
     else:
-        flags = []  # speed = MetalFX (vtenhance default)
-    if 0 < src_fps < 35:   # double a 24/30fps source; >=35 already smooth
-        flags = flags + (["--fps2x"] if not flags else ["--fps2x-warp"])
+        flags = []  # speed = MetalFX (vtenhance default; no warp -> keeps source fps)
+    if flags and 0 < src_fps < 35:   # CNN tiers only: double a 24/30fps source via warp
+        flags = flags + ["--fps2x-warp"]
     return flags
 
 
