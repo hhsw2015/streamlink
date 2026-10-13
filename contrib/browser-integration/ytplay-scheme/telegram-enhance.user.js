@@ -233,19 +233,32 @@
         await streamRange(0, size, size);     // moov is up front; edge-play works as-is
       } else {
         // Non-faststart (mdat before moov): fetch ftyp + the moov tail, have the
-        // server build a faststart head (patched chunk offsets), then stream mdat.
+        // server build a faststart head (patched chunk offsets), then stream mdat
+        // = edge-play. Some Telegram files block far-tail Range fetches (the SW
+        // throws) - if the moov tail can't be fetched, fall back to streaming the
+        // whole file in order (plays once fully downloaded, no edge-play).
         const mdatEnd = box.mdat.off + box.mdat.size;
         log(`non-faststart: mdat[${box.mdat.off},${mdatEnd}) moov tail [${mdatEnd},${size})`);
-        toast("重排索引(边下边播)…");
-        const ftyp = await fetchRange(box.ftyp ? box.ftyp.off : 0,
-                                      box.ftyp ? box.ftyp.off + box.ftyp.size : 0);
-        const moov = await fetchRange(mdatEnd, size);
-        const head = new Uint8Array(ftyp.length + moov.length);
-        head.set(ftyp, 0); head.set(moov, ftyp.length);
-        await pushChunk(head, 0, size, false,
-          `&rebuild=1&ftyp_len=${ftyp.length}&orig_mdat_off=${box.mdat.off}`);
-        toast("下载中…");
-        await streamRange(box.mdat.off, mdatEnd, size);   // the mdat box, in order
+        let head = null;
+        try {
+          toast("重排索引(边下边播)…");
+          const ftyp = await fetchRange(box.ftyp ? box.ftyp.off : 0,
+                                        box.ftyp ? box.ftyp.off + box.ftyp.size : 0);
+          const moov = await fetchRange(mdatEnd, size);   // the tail; may be blocked
+          head = new Uint8Array(ftyp.length + moov.length);
+          head.set(ftyp, 0); head.set(moov, ftyp.length);
+        } catch (e) {
+          log("moov tail fetch failed (" + e.message + ") -> whole-file fallback");
+        }
+        if (head) {
+          await pushChunk(head, 0, size, false,
+            `&rebuild=1&ftyp_len=${box.ftyp ? box.ftyp.size : 0}&orig_mdat_off=${box.mdat.off}`);
+          toast("下载中…");
+          await streamRange(box.mdat.off, mdatEnd, size);   // the mdat box, in order
+        } else {
+          toast("索引在末尾,整段下载后播放…", 6000);
+          await streamRange(0, size, size);   // whole file in order; plays when complete
+        }
       }
       log("download + push complete");
       toast("已送入增强,SenPlayer 即将打开", 5000);
