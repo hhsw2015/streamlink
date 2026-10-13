@@ -2792,6 +2792,65 @@ class LocalEnhancePipe(EnhancePipe):
         return False
 
 
+# mp4 boxes that contain child boxes (walked recursively to find stco/co64).
+_MP4_CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts",
+                   b"dinf", b"udta", b"mvex", b"moof", b"traf"}
+
+
+def _faststart_patch_offsets(buf: bytearray, start: int, end: int, delta: int) -> bool:
+    """Add `delta` to every chunk offset (stco 32-bit / co64 64-bit) in the box
+    range [start,end) of `buf`, recursing into container boxes. Returns False if a
+    32-bit stco entry would overflow (caller falls back to download-whole). This is
+    the qt-faststart offset fix: when moov moves ahead of mdat, every absolute
+    chunk offset shifts by the size difference."""
+    p = start
+    while p + 8 <= end:
+        size = struct.unpack_from(">I", buf, p)[0]
+        typ = bytes(buf[p + 4:p + 8])
+        hdr = 8
+        if size == 1:
+            size = struct.unpack_from(">Q", buf, p + 8)[0]; hdr = 16
+        elif size == 0:
+            size = end - p
+        if size < hdr or p + size > end:
+            break
+        box_end = p + size
+        if typ in _MP4_CONTAINERS:
+            if not _faststart_patch_offsets(buf, p + hdr, box_end, delta):
+                return False
+        elif typ == b"stco":
+            cnt = struct.unpack_from(">I", buf, p + hdr + 4)[0]
+            o = p + hdr + 8
+            for _ in range(cnt):
+                v = struct.unpack_from(">I", buf, o)[0] + delta
+                if v > 0xFFFFFFFF or v < 0:
+                    return False   # would overflow 32-bit -> can't patch in place
+                struct.pack_into(">I", buf, o, v)
+                o += 4
+        elif typ == b"co64":
+            cnt = struct.unpack_from(">I", buf, p + hdr + 4)[0]
+            o = p + hdr + 8
+            for _ in range(cnt):
+                v = struct.unpack_from(">Q", buf, o)[0] + delta
+                struct.pack_into(">Q", buf, o, v)
+                o += 8
+        p = box_end
+    return True
+
+
+def _faststart_head(ftyp: bytes, moov: bytes, orig_mdat_off: int) -> bytes | None:
+    """Build a faststart head (ftyp + offset-patched moov) for a non-faststart
+    file whose mdat sits before moov. The relocated mdat box will start right after
+    this head, so every chunk offset shifts by (new_mdat_off - orig_mdat_off).
+    Returns None if the offsets can't be patched (32-bit overflow)."""
+    new_mdat_off = len(ftyp) + len(moov)
+    delta = new_mdat_off - orig_mdat_off
+    mv = bytearray(moov)
+    if not _faststart_patch_offsets(mv, 0, len(mv), delta):
+        return None
+    return ftyp + bytes(mv)
+
+
 def _download_progressive_local(proxy: str | None, media: dict) -> str | None:
     """Download an IP-signed progressive file WHOLE to a local temp file so it can
     be enhanced locally. vtenhance's AVAssetReader can't stream a remote/IP-signed
@@ -2889,7 +2948,7 @@ def _serve_ingest(args) -> int:
     src = os.path.join(tmp_dir, "insrc.mp4")
     open(src, "wb").close()
     state = {"done": False, "bytes": 0, "pipe": None, "err": None,
-             "t0": None, "total": 0}
+             "t0": None, "total": 0, "starting": False}
     last_activity = {"t": time.time()}
     enhance = args.enhance if args.enhance in ("speed", "quality", "max", "photo") else "photo"
 
@@ -2903,38 +2962,42 @@ def _serve_ingest(args) -> int:
         h.send_header("Access-Control-Max-Age", "86400")  # cache preflight (per-chunk POST)
 
     def _try_start_enhance():
-        # Start once the moov head + buffer is readable (ffprobe gives real dims).
-        if state["pipe"] is not None or state["err"]:
+        # Start once the moov head + ~2MB of mdat is readable (ffprobe gives dims).
+        # Guard against double-entry; the heavy work (spawn vtenhance + wait_ready +
+        # launch player) runs on a BACKGROUND thread so it never blocks the POST
+        # handler that is feeding the growing file (that deadlocks the download).
+        if state.get("starting") or state["pipe"] is not None or state["err"]:
             return
         if state["bytes"] < (2 << 20) and not state["done"]:
             return
         w, h, fps, dur = _ffprobe_props(src)
         if w <= 0 or h <= 0 or dur <= 0:
             return  # moov not fully readable yet; wait for more bytes
-        # Edge-play is mandatory: start as soon as the moov head + a small buffer is
-        # present, never wait for the full download. A slow download that the enhancer
-        # catches up to does NOT crash - vtenhance runs in --growing mode and waits
-        # for more bytes (the player then buffers at the HLS level like any stream,
-        # and recovers as data arrives). Max parallel download keeps that rare.
-        plan = enhance_plan(w, h, fps, enhance, native=True)
-        ow, oh = plan if plan else (w * 2, h * 2)
-        if _is_dovi_p5p7(src):
-            tier = enhance if enhance in ("max", "photo", "quality") else "quality"
-            vt_flags = _vt_tier_flags(tier, h)
-            log("ingest: Dolby Vision P5/P7 -> in-process BT.2020 PQ reconstruction")
-        else:
-            vt_flags = _vt_tier_flags(enhance, h)
-        log(f"ingest {w}x{h}@{fps:g} -> {ow}x{oh} {enhance} (edge-play, {dur:.0f}s)")
-        pipe = LocalEnhancePipe(src, ow, oh, dur, vt_flags, growing=True)
-        if not pipe.wait_ready():
-            pipe.cleanup(); state["err"] = "enhancer produced no output"; return
-        state["pipe"] = pipe
-        if not args.no_open:
-            # launch the player now (first segments are ready); it plays while the
-            # rest downloads + enhances.
-            port = srv.server_address[1]
-            launch_player(args.player, f"http://127.0.0.1:{port}/enh/index.m3u8",
-                          "Telegram video")
+        state["starting"] = True
+
+        def _start():
+            # Edge-play: start now, never wait for the full download. A slow download
+            # the enhancer catches up to does NOT crash - vtenhance --growing waits
+            # for more bytes and resumes (the player buffers like any stream).
+            plan = enhance_plan(w, h, fps, enhance, native=True)
+            ow, oh = plan if plan else (w * 2, h * 2)
+            if _is_dovi_p5p7(src):
+                tier = enhance if enhance in ("max", "photo", "quality") else "quality"
+                vt_flags = _vt_tier_flags(tier, h)
+                log("ingest: Dolby Vision P5/P7 -> in-process BT.2020 PQ reconstruction")
+            else:
+                vt_flags = _vt_tier_flags(enhance, h)
+            log(f"ingest {w}x{h}@{fps:g} -> {ow}x{oh} {enhance} (edge-play, {dur:.0f}s)")
+            pipe = LocalEnhancePipe(src, ow, oh, dur, vt_flags, growing=True)
+            if not pipe.wait_ready():
+                pipe.cleanup(); state["err"] = "enhancer produced no output"; return
+            state["pipe"] = pipe
+            if not args.no_open:
+                port = srv.server_address[1]
+                launch_player(args.player, f"http://127.0.0.1:{port}/enh/index.m3u8",
+                              "Telegram video")
+
+        threading.Thread(target=_start, daemon=True).start()
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -2947,7 +3010,6 @@ def _serve_ingest(args) -> int:
 
         def do_POST(self):
             last_activity["t"] = time.time()
-            log(f"ingest <- POST {self.path} (len={self.headers.get('Content-Length','?')})")
             # The page pushes the file as a sequence of in-order fixed-size chunk
             # POSTs (a streaming body only works over HTTP/2; this server is 1.1).
             # Metadata rides the query string (no custom headers -> no extra CORS
@@ -2962,6 +3024,35 @@ def _serve_ingest(args) -> int:
                     state["total"] = ts
             except (ValueError, TypeError):
                 pass
+            # Non-faststart rebuild: this POST's body is ftyp+moov (fetched from the
+            # file's head + tail). Build a faststart head (moov with patched chunk
+            # offsets) and write it as the file head; mdat chunks stream in after.
+            if qs.get("rebuild", ["0"])[0] in ("1", "true"):
+                clen = int(self.headers.get("Content-Length") or 0)
+                body = b""
+                while len(body) < clen:
+                    part = self.rfile.read(min(1 << 20, clen - len(body)))
+                    if not part:
+                        break
+                    body += part
+                ftyp_len = int(qs.get("ftyp_len", ["0"])[0] or 0)
+                orig_mdat_off = int(qs.get("orig_mdat_off", ["0"])[0] or 0)
+                head = _faststart_head(body[:ftyp_len], body[ftyp_len:], orig_mdat_off)
+                if head is None:
+                    state["err"] = "faststart offset overflow"
+                    self.send_response(500); _cors(self)
+                    self.send_header("Content-Length", "0"); self.end_headers(); return
+                with open(src, "wb") as f:
+                    f.write(head)
+                # Count only mdat bytes toward the start gate (the moov head alone
+                # has no media samples; vtenhance needs the mdat box present).
+                state["bytes"] = 0
+                if state["t0"] is None:
+                    state["t0"] = time.time()
+                log(f"ingest: faststart head written ({len(head)} B), awaiting mdat")
+                _try_start_enhance()
+                self.send_response(200); _cors(self)
+                self.send_header("Content-Length", "0"); self.end_headers(); return
             # Append the request body (in file order) to the growing file. A chunked
             # body (streaming client) is dechunked - reading the raw socket would
             # splice chunk-size framing into the video and corrupt it.
@@ -3018,7 +3109,6 @@ def _serve_ingest(args) -> int:
 
         def do_GET(self):
             last_activity["t"] = time.time()
-            log(f"ingest <- GET {self.path}")
             name = os.path.basename(urllib.parse.urlparse(self.path).path)
             pipe = state["pipe"]
             body = pipe.read(name) if pipe else None

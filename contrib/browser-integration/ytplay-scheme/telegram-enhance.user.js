@@ -123,18 +123,90 @@
     }
     toast("下载中…");
 
-    // Push one fixed-size chunk as a NORMAL POST (metadata in the query string,
-    // no custom headers, body is a sized ArrayBuffer -> Content-Length set). A
-    // streaming ReadableStream body only works over HTTP/2; our local server is
-    // HTTP/1.1, where Chrome refuses it with "Failed to fetch".
-    const pushChunk = async (buf, offset, total, final) => {
-      const u = `${INGEST}/ingest?offset=${offset}&total=${total}${final ? "&final=1" : ""}`;
+    // Push a NORMAL fixed-size POST (metadata in the query string, body a sized
+    // ArrayBuffer so Content-Length is set). A streaming ReadableStream body only
+    // works over HTTP/2; the local server is HTTP/1.1 ("Failed to fetch" otherwise).
+    const pushChunk = async (buf, offset, total, final, extra) => {
+      const u = `${INGEST}/ingest?offset=${offset}&total=${total}`
+        + (final ? "&final=1" : "") + (extra || "");
       const r = await fetch(u, { method: "POST", body: buf });
       if (!r.ok) throw new Error("ingest POST " + r.status);
     };
 
+    // Fetch an exact byte range [a,b) assembling 512KB-capped sub-responses.
+    const fetchRange = async (a, b) => {
+      const parts = []; let pos = a;
+      while (pos < b) {
+        let got = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            const r = await fetch(url, { headers: { Range: `bytes=${pos}-${b - 1}` } });
+            if (![200, 206].includes(r.status)) throw new Error("status " + r.status);
+            got = new Uint8Array(await r.arrayBuffer()); break;
+          } catch (e) {
+            if (attempt === 4) throw e;
+            await new Promise((res) => setTimeout(res, 300 * (attempt + 1)));
+          }
+        }
+        if (!got || got.length === 0) break;
+        parts.push(got); pos += got.length;
+      }
+      if (parts.length === 1) return parts[0];
+      const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+      return out;
+    };
+
+    // Parallel-download [a,b) and push it in order (final=1 on the last chunk).
+    const streamRange = async (a, b, total) => {
+      const n = Math.ceil((b - a) / CHUNK);
+      const ready = new Map();
+      let nextToClaim = 0, pushPos = 0, waiterIdx = -1, waiterResolve = null;
+      const WINDOW = LANES * 3;
+      const lane = async () => {
+        while (true) {
+          while (nextToClaim - pushPos > WINDOW) await new Promise(r => setTimeout(r, 20));
+          const i = nextToClaim++;
+          if (i >= n) return;
+          const s = a + i * CHUNK, e = Math.min(s + CHUNK, b);
+          ready.set(i, await fetchRange(s, e));
+          if (i === waiterIdx && waiterResolve) { const r = waiterResolve; waiterResolve = null; r(); }
+        }
+      };
+      const lanesDone = Promise.all(Array.from({ length: Math.min(LANES, n) }, lane));
+      for (let i = 0; i < n; i++) {
+        pushPos = i;
+        while (!ready.has(i)) {
+          await new Promise(res => { waiterIdx = i; waiterResolve = res; if (ready.has(i)) { waiterResolve = null; res(); } });
+        }
+        const data = ready.get(i); ready.delete(i);
+        await pushChunk(data, a + i * CHUNK, total, i === n - 1);
+      }
+      await lanesDone;
+    };
+
+    // Parse top-level mp4 boxes from the file head: find ftyp / mdat / moov and
+    // whether it's faststart (moov before mdat). Reads box headers only.
+    const parseLayout = async (size) => {
+      const head = await fetchRange(0, Math.min(size, 256 * 1024));
+      const dv = new DataView(head.buffer);
+      let p = 0; const box = {};
+      while (p + 8 <= head.length) {
+        let sz = dv.getUint32(p), hdr = 8;
+        const typ = String.fromCharCode(head[p + 4], head[p + 5], head[p + 6], head[p + 7]);
+        if (sz === 1) {                       // 64-bit largesize
+          sz = dv.getUint32(p + 8) * 2 ** 32 + dv.getUint32(p + 12); hdr = 16;
+        }
+        box[typ] = { off: p, size: sz };
+        if (typ === "moov" || !sz) break;     // moov (faststart) or unknown -> stop
+        if (typ === "mdat") { box.mdat = { off: p, size: sz }; break; } // moov is after
+        p += sz;
+      }
+      return box;
+    };
+
     try {
-      // 2. blob: src = already in memory -> push it whole
+      // blob: src = already in memory -> push whole
       if (url.startsWith("blob:")) {
         const buf = new Uint8Array(await (await fetch(url)).arrayBuffer());
         await pushChunk(buf, 0, buf.length, true);
@@ -142,9 +214,8 @@
         return;
       }
 
-      // 3. sized Range download
       const { size, ranged } = await probeSize(url);
-      if (!ranged || !size) {
+      if (!ranged || !size) {                 // no Range -> single whole fetch
         const buf = new Uint8Array(await (await fetch(url)).arrayBuffer());
         await pushChunk(buf, 0, buf.length, true);
         log("pushed (no-range)", buf.length, "bytes");
@@ -152,73 +223,30 @@
       }
       log(`size ${(size / 1e6).toFixed(1)} MB, ${LANES} lanes x ${CHUNK >> 20}MB`);
 
-      const nChunks = Math.ceil(size / CHUNK);
-      const ready = new Map();        // index -> Uint8Array (downloaded, awaiting push)
-      let nextToClaim = 0, pushPos = 0;
-      let waiterIdx = -1, waiterResolve = null;
-      const WINDOW = LANES * 3;        // bound read-ahead (memory) for big files
-
-      // Fetch EXACTLY the [i*CHUNK, +CHUNK) window. Telegram caps each Range
-      // response at ~512KB, so one request can return fewer bytes than asked -
-      // keep requesting the remainder until the window is full (or EOF).
-      const fetchChunk = async (i) => {
-        const start = i * CHUNK;
-        const stop = Math.min(start + CHUNK, size);   // exclusive
-        const parts = [];
-        let pos = start;
-        while (pos < stop) {
-          let got = null;
-          for (let attempt = 0; attempt < 5; attempt++) {
-            try {
-              const r = await fetch(url, { headers: { Range: `bytes=${pos}-${stop - 1}` } });
-              if (![200, 206].includes(r.status)) throw new Error("status " + r.status);
-              got = new Uint8Array(await r.arrayBuffer());
-              break;
-            } catch (e) {
-              if (attempt === 4) throw e;
-              await new Promise((res) => setTimeout(res, 300 * (attempt + 1)));
-            }
-          }
-          if (!got || got.length === 0) break;   // no progress -> EOF
-          parts.push(got); pos += got.length;
-        }
-        if (parts.length === 1) return parts[0];
-        const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-        let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
-        return out;
-      };
-
-      // parallel download lanes fill `ready` ahead of the sequential pusher,
-      // bounded by WINDOW so a 3.7GB file doesn't buffer unboundedly in memory.
-      const lane = async () => {
-        while (true) {
-          while (nextToClaim - pushPos > WINDOW) {
-            await new Promise((res) => setTimeout(res, 20));
-          }
-          const i = nextToClaim++;
-          if (i >= nChunks) return;
-          ready.set(i, await fetchChunk(i));
-          if (i === waiterIdx && waiterResolve) {
-            const r = waiterResolve; waiterResolve = null; r();
-          }
-        }
-      };
-      const lanesDone = Promise.all(
-        Array.from({ length: Math.min(LANES, nChunks) }, lane));
-
-      // in-order pusher: POST chunk i once downloaded, waiting if a lane is behind
-      for (let i = 0; i < nChunks; i++) {
-        pushPos = i;
-        while (!ready.has(i)) {
-          await new Promise((res) => {
-            waiterIdx = i; waiterResolve = res;
-            if (ready.has(i)) { waiterResolve = null; res(); }
-          });
-        }
-        const data = ready.get(i); ready.delete(i);
-        await pushChunk(data, i * CHUNK, size, i === nChunks - 1);
+      const box = await parseLayout(size);
+      const faststart = box.moov && box.mdat && box.moov.off < box.mdat.off;
+      if (!box.mdat) {                        // couldn't parse -> stream whole, in order
+        log("layout unknown -> stream whole");
+        await streamRange(0, size, size);
+      } else if (faststart) {
+        log("faststart -> stream whole");
+        await streamRange(0, size, size);     // moov is up front; edge-play works as-is
+      } else {
+        // Non-faststart (mdat before moov): fetch ftyp + the moov tail, have the
+        // server build a faststart head (patched chunk offsets), then stream mdat.
+        const mdatEnd = box.mdat.off + box.mdat.size;
+        log(`non-faststart: mdat[${box.mdat.off},${mdatEnd}) moov tail [${mdatEnd},${size})`);
+        toast("重排索引(边下边播)…");
+        const ftyp = await fetchRange(box.ftyp ? box.ftyp.off : 0,
+                                      box.ftyp ? box.ftyp.off + box.ftyp.size : 0);
+        const moov = await fetchRange(mdatEnd, size);
+        const head = new Uint8Array(ftyp.length + moov.length);
+        head.set(ftyp, 0); head.set(moov, ftyp.length);
+        await pushChunk(head, 0, size, false,
+          `&rebuild=1&ftyp_len=${ftyp.length}&orig_mdat_off=${box.mdat.off}`);
+        toast("下载中…");
+        await streamRange(box.mdat.off, mdatEnd, size);   // the mdat box, in order
       }
-      await lanesDone;
       log("download + push complete");
       toast("已送入增强,SenPlayer 即将打开", 5000);
     } catch (e) {
