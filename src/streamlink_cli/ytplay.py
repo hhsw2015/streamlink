@@ -2744,14 +2744,17 @@ class LocalEnhancePipe(EnhancePipe):
     SEG = 1.0  # 1s segments (vs EnhancePipe's 2s): first frame lands ~2x sooner.
 
     def __init__(self, path: str, out_w: int, out_h: int, duration: float,
-                 vt_flags: list[str]):
+                 vt_flags: list[str], growing: bool = False):
         import tempfile
         self.dir = tempfile.mkdtemp(prefix="ytplay-local-")
         self.done = False
         self.playlist = self._build_playlist(duration)
+        # --growing: the input file is still being written (edge-play). vtenhance
+        # waits on a read underrun + resumes instead of aborting; EOF is the
+        # "<path>.done" sentinel the caller touches when the download finishes.
         cmd = ([_vtenhance_path() or "vtenhance", path, self.dir, "--hls",
                 "--seg-interval", str(self.SEG), "--scale", f"{out_w}x{out_h}",
-                "--audio"] + vt_flags)
+                "--audio"] + (["--growing"] if growing else []) + vt_flags)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.yv = self.ya = None   # no yt-dlp source for a local file
@@ -2867,6 +2870,186 @@ def _download_progressive_local(proxy: str | None, media: dict) -> str | None:
         os.remove(tmp)
         return None
     return tmp
+
+
+def _serve_ingest(args) -> int:
+    """Edge-play a browser-pushed stream: the page (e.g. Telegram web, the only
+    place that can fetch the media) POSTs the bytes to /ingest; we append them to
+    a growing faststart mp4 and start the native enhancer as soon as the moov
+    head + a small buffer is present - so playback begins while the download is
+    still running. Because the parallel browser download outpaces the 1x realtime
+    playback (and enhance runs >=1.4x realtime), the enhancer never catches the
+    download front -> no stall. Resolution is auto-detected from the file's moov
+    (ffprobe); the tier is whatever --enhance says (the page's right-click pick,
+    default photo)."""
+    if not _vtenhance_path():
+        log("ingest: vtenhance not built"); return 1
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="ytplay-ingest-")
+    src = os.path.join(tmp_dir, "insrc.mp4")
+    open(src, "wb").close()
+    state = {"done": False, "bytes": 0, "pipe": None, "err": None,
+             "t0": None, "total": 0}
+    last_activity = {"t": time.time()}
+    enhance = args.enhance if args.enhance in ("speed", "quality", "max", "photo") else "photo"
+
+    # CORS + Private Network Access: an HTTPS page (web.telegram.org) POSTing to
+    # http://127.0.0.1 needs the preflight answered with these, or Chrome blocks it.
+    def _cors(h):
+        h.send_header("Access-Control-Allow-Origin", "*")
+        h.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        h.send_header("Access-Control-Allow-Headers", "Content-Type, Content-Range, X-Total-Size")
+        h.send_header("Access-Control-Allow-Private-Network", "true")
+
+    def _try_start_enhance():
+        # Start once the moov head + buffer is readable (ffprobe gives real dims).
+        if state["pipe"] is not None or state["err"]:
+            return
+        if state["bytes"] < (2 << 20) and not state["done"]:
+            return
+        w, h, fps, dur = _ffprobe_props(src)
+        if w <= 0 or h <= 0 or dur <= 0:
+            return  # moov not fully readable yet; wait for more bytes
+        # Edge-play is mandatory: start as soon as the moov head + a small buffer is
+        # present, never wait for the full download. A slow download that the enhancer
+        # catches up to does NOT crash - vtenhance runs in --growing mode and waits
+        # for more bytes (the player then buffers at the HLS level like any stream,
+        # and recovers as data arrives). Max parallel download keeps that rare.
+        plan = enhance_plan(w, h, fps, enhance, native=True)
+        ow, oh = plan if plan else (w * 2, h * 2)
+        if _is_dovi_p5p7(src):
+            tier = enhance if enhance in ("max", "photo", "quality") else "quality"
+            vt_flags = _vt_tier_flags(tier, h)
+            log("ingest: Dolby Vision P5/P7 -> in-process BT.2020 PQ reconstruction")
+        else:
+            vt_flags = _vt_tier_flags(enhance, h)
+        log(f"ingest {w}x{h}@{fps:g} -> {ow}x{oh} {enhance} (edge-play, {dur:.0f}s)")
+        pipe = LocalEnhancePipe(src, ow, oh, dur, vt_flags, growing=True)
+        if not pipe.wait_ready():
+            pipe.cleanup(); state["err"] = "enhancer produced no output"; return
+        state["pipe"] = pipe
+        if not args.no_open:
+            # launch the player now (first segments are ready); it plays while the
+            # rest downloads + enhances.
+            port = srv.server_address[1]
+            launch_player(args.player, f"http://127.0.0.1:{port}/enh/index.m3u8",
+                          "Telegram video")
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a): pass
+
+        def do_OPTIONS(self):
+            self.send_response(204); _cors(self); self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_POST(self):
+            last_activity["t"] = time.time()
+            # Total file size (for the slow-download rate check) - the page knows it
+            # from its Range probe and sends it; without it we just wait for the full
+            # download before enhancing.
+            try:
+                ts = int(self.headers.get("X-Total-Size") or 0)
+                if ts > 0:
+                    state["total"] = ts
+            except ValueError:
+                pass
+            # Append the request body (in file order) to the growing file. A browser
+            # streaming fetch body is Transfer-Encoding: chunked (fetch forbids
+            # setting Content-Length), so dechunk it - reading the raw socket would
+            # splice chunk-size framing into the video and corrupt it.
+            te = (self.headers.get("Transfer-Encoding") or "").lower()
+            with open(src, "ab") as f:
+                def _sink(buf):
+                    if state["t0"] is None:
+                        state["t0"] = time.time()
+                    f.write(buf); f.flush()
+                    state["bytes"] += len(buf)
+                    _try_start_enhance()
+                if "chunked" in te:
+                    rf = self.rfile
+                    while True:
+                        line = rf.readline()
+                        if not line:
+                            break
+                        try:
+                            sz = int(line.split(b";")[0].strip() or b"0", 16)
+                        except ValueError:
+                            break
+                        if sz == 0:
+                            rf.readline()      # trailing CRLF after the last chunk
+                            break
+                        need = sz
+                        while need > 0:
+                            buf = rf.read(min(1 << 20, need))
+                            if not buf:
+                                break
+                            _sink(buf); need -= len(buf)
+                        rf.readline()          # CRLF terminating this chunk
+                else:
+                    clen = self.headers.get("Content-Length")
+                    remaining = int(clen) if clen else None
+                    while remaining is None or remaining > 0:
+                        want = 1 << 20 if remaining is None else min(1 << 20, remaining)
+                        buf = self.rfile.read(want)
+                        if not buf:
+                            break
+                        _sink(buf)
+                        if remaining is not None:
+                            remaining -= len(buf)
+            # Contract: ONE (streaming) POST carries the whole file in order, so its
+            # end = download complete. Touch the sentinel so a --growing vtenhance
+            # knows this is real EOF (not an underrun to wait through).
+            state["done"] = True
+            try:
+                open(src + ".done", "w").close()
+            except OSError:
+                pass
+            _try_start_enhance()
+            self.send_response(200); _cors(self)
+            self.send_header("Content-Length", "0"); self.end_headers()
+
+        def do_GET(self):
+            last_activity["t"] = time.time()
+            name = os.path.basename(urllib.parse.urlparse(self.path).path)
+            pipe = state["pipe"]
+            body = pipe.read(name) if pipe else None
+            if body is None:
+                self.send_response(404); _cors(self)
+                self.send_header("Content-Length", "0"); self.end_headers(); return
+            ctype = ("application/vnd.apple.mpegurl" if name.endswith(".m3u8")
+                     else "video/mp4")
+            self.send_response(200); _cors(self)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try: self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError): pass
+
+    srv = RelayServer(("127.0.0.1", args.port), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log(f"ingest ready http://127.0.0.1:{port}/ingest (POST stream here)")
+    if args.serve_info:
+        _write_serve_info(args.serve_info, port,
+                          f"http://127.0.0.1:{port}/enh/index.m3u8", "Telegram video", args)
+    try:
+        while True:
+            time.sleep(1)
+            if state["err"]:
+                log("ingest error: " + state["err"]); break
+            if (args.idle_timeout and state["pipe"] is not None
+                    and time.time() - last_activity["t"] > args.idle_timeout):
+                log("idle timeout, exiting"); break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if state["pipe"]:
+            state["pipe"].cleanup()
+        srv.shutdown()
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return 0 if not state["err"] else 1
 
 
 def _serve_local(path: str, args) -> int:
@@ -3281,6 +3464,11 @@ def main() -> int:
     parser.add_argument("--enhance", default="", metavar="MODE",
                         help="GPU AI upscale: speed (MetalFX) | quality (CuNNy) | "
                              "max (ArtCNN, anime) | photo (FSRCNNX, photographic). Empty = off.")
+    parser.add_argument("--ingest", action="store_true",
+                        help="receive a pushed video stream (POST /ingest) into a growing "
+                             "local file and enhance it live (edge-play while it downloads). "
+                             "For browser-only sources like Telegram web: the page fetches "
+                             "the media (parallel Range) and pushes it here. url is ignored.")
     args = parser.parse_args()
 
     # Prewarm/headless (--no-open): stay silent so page-load prewarms don't spam
@@ -3288,6 +3476,11 @@ def main() -> int:
     if args.no_open:
         global _NOTIFY_QUIET
         _NOTIFY_QUIET = True
+
+    # Ingest mode: a browser-only source (Telegram web) pushes the media stream to
+    # us; enhance it live from a growing local file (edge-play while downloading).
+    if args.ingest:
+        return _serve_ingest(args)
 
     # Local file (or file:// URL): no site extraction -> instant open, near-local.
     local_path = None

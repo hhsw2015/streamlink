@@ -39,6 +39,33 @@ launches the player, exactly like the browser-extension native host.
 Logs: `/tmp/streamlink-scheme-handler.log` (handler),
 `/tmp/streamlink-redirect.log` (ytplay child output, shared with the host).
 
+## Telegram enhance-play (edge-play while downloading)
+
+Telegram web videos have no public URL - the bytes are only fetchable inside the
+logged-in web page (its service worker streams them from the DC, which is how
+`telegram-enhance.user.js` reaches **public AND restricted** channels alike). So
+instead of handing a URL to ytplay, the page downloads the media and pushes it in:
+
+```
+ytplay://ingest?enhance=photo&player=senplayer
+```
+
+- The scheme handler starts `streamlink-ytplay --ingest` on a fixed port (41599).
+- `telegram-enhance.user.js` adds a ✨ button to the Telegram video controls. On
+  click it **parallel-downloads** the video (8 Range lanes, reordered) at max
+  speed and streams it to `http://127.0.0.1:41599/ingest`.
+- ytplay writes a growing faststart mp4, **auto-detects the resolution** (ffprobe
+  the moov - nothing hardcoded; picks the matching ANE model by source height),
+  and starts enhancing from a ~2 MB buffer - **edge-play**: playback opens in
+  SenPlayer while the download is still running. Because the parallel download
+  outpaces 1x playback (and enhance runs >=1.4x realtime at 4K), it never stalls.
+- Files whose moov is at the end (some file/document messages) can't edge-play;
+  ytplay just starts once the whole file is received (small Telegram files + the
+  parallel download make that fast).
+
+Install the userscript in Tampermonkey; default tier is `photo` (edit `ENHANCE`
+in the script, or the button's handler, to change it).
+
 ## Source URL notes
 
 - Site pages (YouTube/PH/...): full yt-dlp extraction, streaming enhance.
