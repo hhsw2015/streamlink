@@ -172,16 +172,25 @@
   // Telegram has two web clients with different DOM (K = /k/, the default;
   // A/Z = /a/). Try both; read the live <video> (K uses .src, A/Z currentSrc).
   const currentVideoURL = () => {
+    // A/Z client (/a/): the ACTIVE slide's video holds the real src; the other
+    // (preloaded) slides have empty src, so scope to --active.
+    const av = document.querySelector(".MediaViewerSlide--active video.media-viewer-video")
+      || document.querySelector(".MediaViewerSlide--active .VideoPlayer video");
+    if (av) {
+      const u = av.currentSrc || av.src || av.querySelector("source")?.src;
+      if (u) return u;
+    }
+    // K client (/k/)
     const kv = document.querySelector(
-      ".media-viewer-whole .media-viewer-movers .media-viewer-aspecter video");
+      ".media-viewer-whole .media-viewer-aspecter video");
     if (kv) {
       const u = kv.src || kv.currentSrc || kv.querySelector("source")?.src;
       if (u) return u;
     }
-    const av = document.querySelector("#MediaViewer .VideoPlayer video");
-    if (av) {
-      const u = av.currentSrc || av.src || av.querySelector("source")?.src;
-      if (u) return u;
+    // Generic fallback: any video with a real (non-blob) http(s) src.
+    for (const v of document.querySelectorAll("video")) {
+      const u = v.currentSrc || v.src;
+      if (u && /^https?:/.test(u)) return u;
     }
     return null;
   };
@@ -223,7 +232,8 @@
       }
     }
     // --- webz "A/Z" client (web.telegram.org/a/) ---
-    const aPlayer = document.querySelector("#MediaViewer .VideoPlayer");
+    const aPlayer = document.querySelector(".MediaViewerSlide--active .VideoPlayer")
+      || document.querySelector("#MediaViewer .VideoPlayer");
     if (aPlayer) {
       const controls = aPlayer.querySelector(".VideoPlayerControls .buttons");
       if (controls && !controls.querySelector("button.tel-enhance")) {
