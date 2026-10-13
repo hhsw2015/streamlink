@@ -202,13 +202,26 @@ def _ane_model_path(height: int, family: str = "artcnn", f32: bool = False) -> s
     picks the heavier C4F32 variant (sharper; fits 4K30 at ~45fps on the ANE,
     so only for <=48fps sources - 60fps needs C4F16's speed for 4K60).
     """
+    suffix = "_f32" if f32 else ""
     for base in (os.environ.get("YTPLAY_ANE_MODELS"),
                  os.path.expanduser("~/Dev/metalenhance/models")):
-        if not base:
+        if not base or not os.path.isdir(base):
             continue
-        c = os.path.join(base, f"{family}{height}{'_f32' if f32 else ''}.mlmodelc")
-        if os.path.exists(c):
-            return c
+        exact = os.path.join(base, f"{family}{height}{suffix}.mlmodelc")
+        if os.path.exists(exact):
+            return exact
+        # No exact-height model (non-standard source like a 1916x1036 movie): use the
+        # smallest model TALLER than the source - vtenhance pads the source into it.
+        import glob
+        avail = []
+        for p in glob.glob(os.path.join(base, f"{family}*{suffix}.mlmodelc")):
+            m = re.search(rf"{re.escape(family)}(\d+){re.escape(suffix)}\.mlmodelc$",
+                          os.path.basename(p))
+            if m:
+                avail.append(int(m.group(1)))
+        for hh in sorted(avail):
+            if hh >= height:
+                return os.path.join(base, f"{family}{hh}{suffix}.mlmodelc")
     return None
 
 
@@ -2696,22 +2709,35 @@ def _ffprobe_props(path: str) -> tuple[int, int, float, float]:
         return 0, 0, 30.0, 0.0
 
 
-def _vt_tier_flags(enhance: str, src_h: int, src_fps: float = 0.0) -> list[str]:
-    """vtenhance flags for a tier on a local file. SR per tier, plus our GPU
-    flow-warp frame interpolation (SR-first VFI) for a low-fps source (24/30 ->
-    48/60) so motion is smooth like the streaming path. Warp operates on the CNN's
-    SR'd frames, so it only applies to the CNN tiers (quality/max/photo), never the
-    MetalFX speed tier - we do NOT use Apple's frame processor."""
+def _vt_tier_flags(enhance: str, src_h: int, src_fps: float = 0.0,
+                   src: dict | None = None) -> list[str]:
+    """vtenhance flags for a tier on a local file - kept identical to the streaming
+    path's heavy tier (_vt_seg_flags) so Telegram/local photo looks the same as a
+    YouTube photo stream: ANE FSRCNNX super-res, GPU flow-warp interpolation gated
+    on the ANE (freed GPU) for a <35fps source, bitrate-driven denoise + MC temporal
+    (photo keeps skin/texture at 0.4), dense flow, and --hq for <=40fps output. We
+    never use Apple FRC."""
+    ane_model = None
     if enhance in ("max", "photo"):
         fam = "fsrcnnx" if enhance == "photo" else "artcnn"
-        model = _ane_model_path(src_h, fam)
-        flags = ["--cunny", "--ane", model] if model else ["--cunny"]
-    elif enhance == "quality":
-        flags = ["--cunny"]
+        ane_model = _ane_model_path(src_h, fam)
+        flags = ["--cunny", "--ane", ane_model] if ane_model \
+            else list(NATIVE_TIERS.get(enhance, ["--cunny"]))
     else:
-        flags = []  # speed = MetalFX (vtenhance default; no warp -> keeps source fps)
-    if flags and 0 < src_fps < 35:   # CNN tiers only: double a 24/30fps source via warp
-        flags = flags + ["--fps2x-warp"]
+        flags = list(NATIVE_TIERS.get(enhance, []))   # quality=--cunny, speed=[]
+    ane = enhance in ("max", "photo") and ane_model is not None
+    warp = ane and 0 < src_fps < 35           # SR-first VFI on the ANE-freed GPU
+    if warp:
+        flags += ["--fps2x-warp"]
+    dn = _denoise_strength(src) if (src and enhance in ("quality", "max", "photo")) else 0.0
+    has_temporal = False
+    if dn > 0:
+        flags += ["--denoise", f"{dn:.3f}", "--temporal", "0.4" if enhance == "photo" else "0.7"]
+        has_temporal = True
+    if has_temporal and (enhance == "quality" or ane):
+        flags += ["--dense-flow"]
+    if (src_fps * (2 if warp else 1)) <= 40:   # --hq only helps <=40fps output
+        flags += ["--hq"]
     return flags
 
 
@@ -2992,12 +3018,14 @@ def _serve_ingest(args) -> int:
             # for more bytes and resumes (the player buffers like any stream).
             plan = enhance_plan(w, h, fps, enhance, native=True)
             ow, oh = plan if plan else (w * 2, h * 2)
+            tbr = (state["total"] * 8 / dur / 1000) if (state["total"] and dur) else 0
+            srcinfo = {"width": w, "height": h, "fps": fps, "tbr": tbr, "vcodec": ""}
             if _is_dovi_p5p7(src):
                 tier = enhance if enhance in ("max", "photo", "quality") else "quality"
-                vt_flags = _vt_tier_flags(tier, h, fps)
+                vt_flags = _vt_tier_flags(tier, h, fps, srcinfo)
                 log("ingest: Dolby Vision P5/P7 -> in-process BT.2020 PQ reconstruction")
             else:
-                vt_flags = _vt_tier_flags(enhance, h, fps)
+                vt_flags = _vt_tier_flags(enhance, h, fps, srcinfo)
             log(f"ingest {w}x{h}@{fps:g} -> {ow}x{oh} {enhance} (edge-play, {dur:.0f}s)")
             pipe = LocalEnhancePipe(src, ow, oh, dur, vt_flags, growing=True)
             if not pipe.wait_ready():
@@ -3193,12 +3221,18 @@ def _serve_local(path: str, args) -> int:
     # Dolby Vision P5/P7: vtenhance decodes it in-process (auto-detected from the dvhe
     # track) and reconstructs BT.2020 PQ - no preprocess. It just needs a CNN tier, since
     # the RPU path is 10-bit/NV12 (MetalFX is BGRA8 SDR).
+    try:
+        _fsz = os.path.getsize(path)
+    except OSError:
+        _fsz = 0
+    tbr = (_fsz * 8 / dur / 1000) if (_fsz and dur) else 0
+    srcinfo = {"width": w, "height": h, "fps": fps, "tbr": tbr, "vcodec": ""}
     if _is_dovi_p5p7(path):
         dv_tier = args.enhance if args.enhance in ("max", "photo", "quality") else "quality"
-        vt_flags = _vt_tier_flags(dv_tier, h, fps)
+        vt_flags = _vt_tier_flags(dv_tier, h, fps, srcinfo)
         log("local: Dolby Vision P5/P7 -> in-process BT.2020 PQ reconstruction")
     else:
-        vt_flags = _vt_tier_flags(args.enhance, h, fps)
+        vt_flags = _vt_tier_flags(args.enhance, h, fps, srcinfo)
     log(f"local {w}x{h}@{fps:g} -> {ow}x{oh} {args.enhance} (instant open, no extraction)")
     pipe = LocalEnhancePipe(path, ow, oh, dur, vt_flags)
     if not pipe.wait_ready():
